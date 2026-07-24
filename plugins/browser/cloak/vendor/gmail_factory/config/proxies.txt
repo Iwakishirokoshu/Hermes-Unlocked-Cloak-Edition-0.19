@@ -1,0 +1,9 @@
+# Proxy list — one per line.
+# Supported formats:
+#   host:port
+#   host:port:user:pass
+#   protocol://host:port
+#   protocol://user:pass@host:port
+#
+# Hermes can populate this automatically from the cloak-proxy-pool skill.
+# Leave empty if you rely on the Cloak profile to provide the upstream proxy.

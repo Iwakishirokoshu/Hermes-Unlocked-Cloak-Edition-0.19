@@ -1,0 +1,7 @@
+name: browser-cloak
+version: 1.0.0
+description: "Cloak (CloakBrowser) anti-detect browser backend. Self-hosted CloakBrowser-Manager profiles with stealth fingerprints, proxies and GeoIP. Adds cloak_* profile-management tools, captcha detect/solve, humanized input overrides and the Gmail Factory toolset when cloakbrowser/playwright are installed. Select via browser.cloud_provider: cloak."
+author: HermesMulti / xaroundx
+kind: backend
+provides_browser_providers:
+  - cloak

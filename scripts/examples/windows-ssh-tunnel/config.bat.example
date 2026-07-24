@@ -1,0 +1,8 @@
+@echo off
+rem Copy this file to config.bat, then replace the placeholders below.
+set "VPS_HOST=YOUR_SERVER_IP"
+set "VPS_USER=root"
+set "SSH_KEY=C:\path\to\id_ed25519"
+set "LOCAL_DASHBOARD_PORT=9119"
+set "LOCAL_CLOAK_MANAGER_PORT=8180"
+set "LOCAL_CDP_PROXY_PORT=8081"

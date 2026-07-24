@@ -1,0 +1,85 @@
+# Full Docker deployment for Hermes Unlocked — Cloak Edition.
+#
+# The bootstrap writes .cloak-compose.env (ignored by git) and invokes this
+# file with `docker compose --project-name <name> --env-file .cloak-compose.env`.
+# Named volumes are project-scoped, so a different project name creates a
+# genuinely isolated Hermes home and CloakBrowser profile store.
+
+services:
+  manager:
+    image: ${CLOAK_MANAGER_IMAGE:-cloakhq/cloakbrowser-manager:latest}
+    restart: unless-stopped
+    environment:
+      AUTH_TOKEN: ${CLOAK_AUTH_TOKEN:?CLOAK_AUTH_TOKEN is required}
+    volumes:
+      - cloak-profiles:/data
+    ports:
+      - "127.0.0.1:${CLOAK_MANAGER_PORT:-8180}:8080"
+
+  bridge:
+    image: python:3.13-slim
+    restart: unless-stopped
+    depends_on:
+      manager:
+        condition: service_started
+    environment:
+      CLOAK_AUTH_TOKEN: ${CLOAK_AUTH_TOKEN:?CLOAK_AUTH_TOKEN is required}
+      CLOAK_MANAGER_URL: http://manager:8080
+      CLOAK_CDP_PROXY_BASE: http://0.0.0.0:8081
+    volumes:
+      - ./scripts/cloak/cdp_bridge.py:/app/cdp_bridge.py:ro
+    command: ["python", "/app/cdp_bridge.py"]
+    ports:
+      - "127.0.0.1:${CLOAK_CDP_BRIDGE_PORT:-8081}:8081"
+
+  setup:
+    image: ${HERMES_CLOAK_IMAGE:-hermes-cloak:local}
+    restart: "no"
+    depends_on:
+      bridge:
+        condition: service_started
+    environment: &hermes_environment
+      HERMES_UID: "10000"
+      HERMES_GID: "10000"
+      CLOAK_AUTH_TOKEN: ${CLOAK_AUTH_TOKEN:?CLOAK_AUTH_TOKEN is required}
+      CLOAK_MANAGER_URL: http://manager:8080
+      # This URL is rendered in the dashboard. Override it for a reverse
+      # proxy or tunnel; `manager` itself only exists inside this network.
+      CLOAK_MANAGER_BROWSER_URL: ${CLOAK_MANAGER_BROWSER_URL:-http://127.0.0.1:${CLOAK_MANAGER_PORT:-8180}}
+      CLOAK_CDP_PROXY_BASE: http://bridge:8081
+    volumes: &hermes_volumes
+      - hermes-data:/opt/data
+    command: ["config", "set", "browser.cloud_provider", "cloak"]
+
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${HERMES_CLOAK_IMAGE:-hermes-cloak:local}
+    restart: unless-stopped
+    depends_on:
+      setup:
+        condition: service_completed_successfully
+    environment:
+      <<: *hermes_environment
+      # Keep the dashboard and its gateway in the same s6 supervision tree.
+      # A separate dashboard container cannot control the gateway's private
+      # /run/service slot, so its Restart action would target a non-existent
+      # gateway-default service.
+      HERMES_GATEWAY_BOOTSTRAP_STATE: running
+      HERMES_DASHBOARD: "1"
+      HERMES_DASHBOARD_HOST: 0.0.0.0
+      HERMES_DASHBOARD_PORT: "9119"
+      HERMES_DASHBOARD_BASIC_AUTH_USERNAME: ${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:?Dashboard username is required}
+      HERMES_DASHBOARD_BASIC_AUTH_PASSWORD: ${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD:?Dashboard password is required}
+      HERMES_DASHBOARD_BASIC_AUTH_SECRET: ${HERMES_DASHBOARD_BASIC_AUTH_SECRET:?Dashboard session secret is required}
+    volumes: *hermes_volumes
+    # s6 launches the dashboard and gateway-default in this container. The
+    # main program stays idle solely to keep the container lifecycle stable.
+    command: ["sleep", "infinity"]
+    ports:
+      - "127.0.0.1:${HERMES_DASHBOARD_PORT:-9119}:9119"
+
+volumes:
+  hermes-data:
+  cloak-profiles:

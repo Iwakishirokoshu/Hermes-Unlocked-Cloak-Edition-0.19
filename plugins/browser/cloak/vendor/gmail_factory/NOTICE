@@ -1,0 +1,51 @@
+Gmail Factory — Hermes-Cloak vendor build
+=========================================
+
+This directory contains a slimmed and adapted fork of:
+
+    https://github.com/ShadowHackrs/Gmail-infinity
+    (c) 2026 Shadow / ShadowHackrs, all rights reserved
+
+The upstream project is shipped under a proprietary licence. We retain
+attribution here and have NOT modified the upstream copyright notices
+that survive inside individual source files. This vendor build exists
+solely to allow Hermes — a personal automation framework — to call the
+Gmail account-creation engine through the same Cloak-managed browser
+infrastructure that powers the rest of the toolkit.
+
+Modifications applied in this build
+-----------------------------------
+
+1. Removed the interactive TUI (auto_gmail_creator.py) and replaced it
+   with a non-interactive ``hermes_runner.py`` CLI driven over stdin
+   JSON.
+
+2. Removed the Selenium engine (``core/selenium_runner.py``), the
+   Appium / Android engine (``core/android_creator.py``), the free-proxy
+   scraper (``core/proxy_fetcher.py``) and the voice OTP server
+   (``services/voice.py``). The Hermes integration only uses the
+   Playwright path.
+
+3. Replaced ``core/behavior.py`` (numpy + scipy Bezier math) with a
+   pure-Python pydoll-derived implementation so this vendor does not
+   need numpy or scipy.
+
+4. Baked Cloak CDP integration into ``core/stealth_browser.py``: when
+   ``BROWSER_CDP_URL`` is set we ``connect_over_cdp`` to the Cloak
+   Manager's CDP proxy and skip every local fingerprint spoof. When
+   ``BROWSER_CDP_URL`` is unset the original launch path runs unchanged.
+
+5. Trimmed ``core/ui.py`` to just the logging helpers used by other
+   modules. The TUI screens are gone.
+
+6. Replaced ``data/accounts.json`` with an empty array and
+   ``config/proxies.txt`` with an empty template (upstream shipped
+   sample data tied to the original author).
+
+No upstream functionality has been added to the public Hermes plug-in
+itself. The vendor lives in its own /usr/local/lib/gmail-factory venv,
+isolated from Hermes' own dependencies.
+
+If you are the upstream author and want this code removed or the
+attribution improved, please open an issue on the
+xaroundx/Hermes-Cloak-Patch repository.

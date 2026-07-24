@@ -1,0 +1,23 @@
+# Gmail Factory — Hermes vendor slim build
+# Installed into /usr/local/lib/gmail-factory/venv by install_gmail_factory.sh.
+# Kept lean so subprocess startup is fast and the venv stays under ~200 MB.
+#
+# Dropped vs upstream ShadowHackrs/Gmail-infinity:
+#   selenium, webdriver-manager, beautifulsoup4, free-proxy   -- legacy engine
+#   Appium-Python-Client                                      -- mobile engine
+#   flask, SpeechRecognition, pydub, waitress                 -- voice OTP server
+#   scipy, numpy                                              -- replaced by inlined pydoll math in core/behavior.py
+
+playwright>=1.40.0
+playwright-stealth>=1.0.6
+
+requests>=2.31.0
+aiohttp>=3.9.0
+
+python-dotenv>=1.0.0
+
+rich>=13.7.0
+colorama>=0.4.6
+
+faker>=22.0.0
+unidecode>=1.3.7
