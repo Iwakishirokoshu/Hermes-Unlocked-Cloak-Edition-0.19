@@ -57,8 +57,8 @@ SCHEMA_CLICK = {
 SCHEMA_TYPE = {
     "type": "object",
     "properties": {
-        "ref": {"type": "string", "description": "Snapshot ref. Cloak refuses refs for text input — pass a CSS selector such as input[type='email'] instead."},
-        "selector": {"type": "string", "description": "CSS selector required for humanized text input, e.g. input[type='email']."},
+        "ref": {"type": "string", "description": "Not usable for text input — snapshot refs belong to agent-browser, a different client from the humanized typing engine. Pass selector instead."},
+        "selector": {"type": "string", "description": "CSS selector for the field — required for humanized text input, e.g. input[type='email'] or #email. Read the id/name/type off the element in the snapshot."},
         "text": {"type": "string"},
         "timeout_ms": {"type": "integer", "default": 30000},
         "verify": {
@@ -131,11 +131,11 @@ def _normalize_ref(ref: str) -> str:
     """Accept both spellings of a snapshot reference.
 
     ``browser_snapshot`` hands the model bare refs (``e5``) and the built-in
-    browser tools take them that way, but :func:`_locator_for` only recognises
-    the ``@e5`` spelling. A bare ref therefore fell through to
+    browser tools take them that way, but the rest of this module only
+    recognises the ``@e5`` spelling. A bare ref therefore fell through to
     ``page.locator("e5")`` — a CSS lookup for a nonexistent ``<e5>`` tag that
-    burns the full timeout twice before failing, instead of resolving to
-    ``aria-ref=e5`` (click/hover) or being refused immediately (text input).
+    burns the full timeout twice before failing, instead of being routed to the
+    native click path (which owns the refs) or refused outright for text input.
     """
     value = str(ref or "").strip()
     match = _SNAPSHOT_REF_RE.match(value)
@@ -153,8 +153,26 @@ def _humanized_selector_required(ref: str) -> Dict[str, Any]:
         "error": "humanized_selector_required",
         "ref": ref,
         "message": (
-            "Cloak text input requires a CSS selector. Re-observe the form and use a stable "
-            "selector; no native browser fallback was used."
+            "Snapshot refs address elements inside agent-browser, which is a different "
+            "client from the humanized typing engine — they cannot be resolved here. "
+            "Pass a CSS selector instead, e.g. selector=\"input[type='email']\" or "
+            "selector=\"#email\"; read the id/name/type off the element in the snapshot. "
+            "Refs still work for browser_click. No native fallback was used."
+        ),
+    }
+
+
+def _no_target_error() -> Dict[str, Any]:
+    """Neither a ref nor a selector arrived — say what to pass, not just what's missing."""
+    return {
+        "ok": False,
+        "humanized": False,
+        "error": "target_required",
+        "message": (
+            "Pass the field to type into: either ref from the latest "
+            "browser_snapshot (e.g. ref=\"e5\") or a CSS selector "
+            "(e.g. selector=\"input[type='email']\"). Re-run browser_snapshot "
+            "if you do not have a current ref."
         ),
     }
 
@@ -176,14 +194,14 @@ def _native_click(ref: str, task_id: Any) -> Any:
 
 
 def _native_press(key: str, task_id: Any) -> Any:
-    # Hermes 0.19 signature is (key, task_id) — no ref parameter.
+    # Hermes 0.19 signature is (key, task_id) вЂ” no ref parameter.
     from tools.browser_tool import browser_press as native_press
 
     return native_press(key, task_id)
 
 
 def _native_hover(ref: str, task_id: Any) -> Any:
-    """Hermes 0.19 has no browser_hover export — drive agent-browser directly."""
+    """Hermes 0.19 has no browser_hover export вЂ” drive agent-browser directly."""
     import json
 
     from tools import browser_tool as bt
@@ -237,7 +255,7 @@ async def browser_type(args: dict, **kw: Any) -> Any:
     task_id = kw.get("task_id")
     target = selector.strip() or _normalize_target(ref, selector)
     if not target:
-        return {"error": "Provide a CSS selector for humanized text input."}
+        return _no_target_error()
     if target.startswith("@"):
         return _humanized_selector_required(target)
     verify = args.get("verify", True)
@@ -274,7 +292,7 @@ async def browser_fill(args: dict, **kw: Any) -> Any:
     task_id = kw.get("task_id")
     target = selector.strip() or _normalize_target(ref, selector)
     if not target:
-        return {"error": "Provide a CSS selector for humanized text input."}
+        return _no_target_error()
     if target.startswith("@"):
         return _humanized_selector_required(target)
     verify = args.get("verify", True)

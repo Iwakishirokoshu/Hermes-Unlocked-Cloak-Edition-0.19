@@ -1301,9 +1301,11 @@ def test_snapshot_ref_maps_onto_playwright_aria_ref():
     assert seen == ["aria-ref=e9"]
 
 
-def test_text_input_refuses_a_bare_ref_immediately():
-    """The humanized-input contract refuses refs for typing. That refusal has to
-    fire on `e5` too, otherwise the model waits out two timeouts to learn it."""
+def test_text_input_refuses_a_ref_with_an_actionable_message():
+    """Snapshot refs come from agent-browser; the humanized typing engine is a
+    separate Playwright client that cannot resolve them (verified live:
+    aria-ref lookups match zero elements). The refusal must therefore name the
+    way out, or the model just retries the same call."""
     import asyncio
     from plugins.browser.cloak._impl import tools_input as ti
 
@@ -1315,11 +1317,31 @@ def test_text_input_refuses_a_bare_ref_immediately():
     try:
         for handler in (ti.browser_type, ti.browser_fill):
             out = asyncio.run(handler({"ref": "e5", "text": "hello"}))
-            assert out["error"] == "humanized_selector_required", out
+            assert out["error"] == "humanized_selector_required"
             assert out["ref"] == "@e5"
+            assert "selector=" in out["message"]
+            assert "browser_click" in out["message"]
     finally:
         ti._hold_page = original
 
+def test_text_input_without_ref_or_selector_says_what_to_pass():
+    """The refusal has to name the way out, or the model just retries it."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_input as ti
+
+    def explode(*args, **kwargs):
+        raise AssertionError("must refuse before touching the browser pool")
+
+    original = ti._hold_page
+    ti._hold_page = explode
+    try:
+        for handler in (ti.browser_type, ti.browser_fill):
+            out = asyncio.run(handler({"text": "hello"}))
+            assert out["error"] == "target_required", out
+            assert "browser_snapshot" in out["message"]
+            assert "selector=" in out["message"]
+    finally:
+        ti._hold_page = original
 
 class _KeyBuffer:
     """Minimal stand-in for the raw keyboard: keeps what the field would hold."""
