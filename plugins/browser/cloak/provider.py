@@ -346,9 +346,45 @@ class CloakBrowserProvider(BrowserProvider):
     # Session lifecycle
     # ------------------------------------------------------------------
 
+    def _profile_is_running(self, base_url: str, profile_id: str) -> bool:
+        """Best-effort liveness check for a leased profile.
+
+        Returns True when the answer is unknown — a manager blip must not throw
+        away a working lease. Only a definite "this profile is not running"
+        retires it.
+        """
+        if not profile_id:
+            return False
+        try:
+            resp = requests.get(
+                f"{base_url}/api/profiles/{profile_id}/status",
+                headers=self._headers(),
+                timeout=10,
+            )
+        except requests.RequestException:
+            return True
+        if resp.status_code == 404:
+            return False
+        if not resp.ok:
+            return True
+        try:
+            return str((resp.json() or {}).get("status", "")).lower() == "running"
+        except ValueError:
+            return True
+
     def create_session(self, task_id: str) -> Dict[str, object]:
-        # Prefer a task-scoped lease if we already created one for this task.
+        # Prefer a task-scoped lease if we already created one for this task —
+        # but only while the profile it names is still up. A lease that outlives
+        # its profile used to shadow every later launch and hand the browser a
+        # dead CDP endpoint, which answers 403 on the websocket upgrade.
         existing = session_leases.get(task_id)
+        if existing and not self._profile_is_running(self._base_url(), existing.profile_id):
+            logger.info(
+                "Cloak: retiring lease for task %s — profile %s is no longer running",
+                task_id, existing.profile_id,
+            )
+            session_leases.pop(task_id)
+            existing = None
         if existing:
             session_leases.bind_env_for_task(task_id)
             try:

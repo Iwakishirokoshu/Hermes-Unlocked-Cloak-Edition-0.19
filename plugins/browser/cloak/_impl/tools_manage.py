@@ -450,12 +450,38 @@ async def _launch_profile(
         profile_state.remember_profile(
             task_id,
             profile_id=profile_id,
-            profile_name=str((binding_before or {}).get("profile_name") or profile),
+            profile_name=launched_name,
             cdp_url=cdp_abs,
             cdp_http_url=os.environ.get("CLOAK_CDP_HTTP_URL", ""),
             proxy=(binding_before or {}).get("proxy"),
             source="cloak_launch",
         )
+        # Own the same session state cloak_set_active owns. The provider checks
+        # the lease *before* the env, so a lease left by an earlier
+        # cloak_set_active would otherwise shadow every later cloak_launch — the
+        # browser kept connecting to the profile that lease named, long after it
+        # had stopped, and answered 403 forever.
+        profile_state.activate_task_binding(task_id)
+        try:
+            from .. import session_leases
+
+            key = profile_state.task_key(task_id)
+            session_leases.put(
+                session_leases.Lease(
+                    task_id=key,
+                    profile_id=str(profile_id),
+                    cdp_url=cdp_abs,
+                    cdp_http_url=os.environ.get("CLOAK_CDP_HTTP_URL", ""),
+                    profile_name=launched_name,
+                    features={"stealth": True, "humanize": True, "prebound": True},
+                )
+            )
+            session_leases.bind_env_for_task(key)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "Profile %s launched but its session lease could not be refreshed: %s",
+                profile_id, redact_cdp_url(exc),
+            )
 
         return {
             "profile_id": resp.get("profile_id", profile_id),

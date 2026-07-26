@@ -1656,3 +1656,102 @@ def test_launch_reports_the_profile_it_actually_launched(monkeypatch):
     assert asyncio.run(
         tm._profile_display_name(Mgr(), "", "old", binding)
     ) == "resolved-by-id"
+
+
+def test_launch_refreshes_the_session_lease(monkeypatch):
+    """The provider reads the lease before the env, so a lease left by an
+    earlier cloak_set_active shadowed every later cloak_launch: the browser kept
+    connecting to a profile that had long stopped and got 403 forever."""
+    import asyncio
+    from plugins.browser.cloak import session_leases
+    from plugins.browser.cloak._impl import profile_state
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    session_leases.put(
+        session_leases.Lease(
+            task_id="t1", profile_id="old-profile",
+            cdp_url="ws://bridge:8081/api/profiles/old-profile/cdp",
+        )
+    )
+
+    class Mgr:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def get_profile(self, profile_id):
+            return {"id": profile_id, "name": "new-name"}
+
+        async def launch(self, profile_id):
+            return {"profile_id": profile_id, "cdp_url": f"/api/profiles/{profile_id}/cdp"}
+
+        async def profile_status(self, profile_id):
+            return {"status": "running"}
+
+        async def bind_browser_cdp_env(self, rel):
+            url = "ws://bridge:8081" + rel
+            os.environ["BROWSER_CDP_URL"] = url
+            return url
+
+    monkeypatch.setattr(tm, "ManagerClient", Mgr)
+    monkeypatch.setattr(tm, "get_pool", lambda: mock.MagicMock())
+    monkeypatch.setattr(profile_state, "get_binding", lambda task_id=None: None)
+    monkeypatch.setattr(profile_state, "remember_profile", lambda *a, **k: {})
+    monkeypatch.setattr(profile_state, "activate_task_binding", lambda task_id=None: "")
+
+    new_id = "11111111-2222-3333-4444-555555555555"
+    out = asyncio.run(tm._launch_profile(new_id, task_id="t1"))
+    assert out.get("active") is True
+
+    lease = session_leases.get("t1")
+    assert lease is not None
+    assert lease.profile_id == new_id, "the lease still names the old profile"
+    assert new_id in lease.cdp_url
+
+
+def test_provider_retires_a_lease_whose_profile_stopped(monkeypatch):
+    from plugins.browser.cloak import session_leases
+    from plugins.browser.cloak.provider import CloakBrowserProvider
+
+    monkeypatch.setenv("CLOAK_MANAGER_URL", "http://127.0.0.1:8080")
+    provider = CloakBrowserProvider()
+
+    session_leases.put(
+        session_leases.Lease(task_id="t2", profile_id="dead", cdp_url="ws://dead/cdp")
+    )
+    monkeypatch.setattr(provider, "_profile_is_running", lambda base, pid: False)
+    monkeypatch.setattr(provider, "_find_profile_by_name", lambda base, name: None)
+    monkeypatch.setattr(provider, "_create_profile", lambda base, name: {"id": "fresh"})
+    monkeypatch.setattr(
+        provider, "_launch_profile",
+        lambda base, pid: {"cdp_url": f"/api/profiles/{pid}/cdp", "already_running": False},
+    )
+    monkeypatch.setattr(provider, "_resolve_cdp_ws", lambda http: "ws://fresh/cdp")
+    monkeypatch.setattr(provider, "_absolute_cdp_url", lambda base, rel: f"{base}{rel}")
+
+    session = provider.create_session("t2")
+    assert session["bb_session_id"] == "fresh"
+    assert session["cdp_url"] == "ws://fresh/cdp"
+    assert session_leases.get("t2").profile_id == "fresh"
+
+
+def test_provider_keeps_a_lease_whose_profile_still_runs(monkeypatch):
+    from plugins.browser.cloak import session_leases
+    from plugins.browser.cloak.provider import CloakBrowserProvider
+
+    monkeypatch.setenv("CLOAK_MANAGER_URL", "http://127.0.0.1:8080")
+    provider = CloakBrowserProvider()
+    session_leases.put(
+        session_leases.Lease(task_id="t3", profile_id="alive", cdp_url="ws://alive/cdp")
+    )
+    monkeypatch.setattr(provider, "_profile_is_running", lambda base, pid: True)
+
+    def explode(*a, **k):
+        raise AssertionError("a live lease must be reused, not rebuilt")
+
+    monkeypatch.setattr(provider, "_create_profile", explode)
+    session = provider.create_session("t3")
+    assert session["cdp_url"] == "ws://alive/cdp"
+    assert session["features"].get("reused_lease") is True
