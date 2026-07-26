@@ -31,6 +31,7 @@ NOT supported by CapSolver (caller should fall back to 2captcha):
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from typing import Any, Optional
 
@@ -107,6 +108,11 @@ def _build_task(kind: str, site_key: str, url: str, extra: dict) -> dict:
         if site_key:
             task["websitePublicKey"] = site_key
             task.pop("websiteKey", None)
+        blob = extra.get("blob") or extra.get("data_exchange_blob") or extra.get("dataExchangeBlob")
+        if extra.get("data"):
+            task["data"] = extra["data"] if isinstance(extra["data"], str) else json.dumps(extra["data"])
+        elif blob:
+            task["data"] = json.dumps({"blob": blob})
     if kind == "amazon_waf":
         task["awsKey"] = site_key
         task["awsIv"] = extra.get("iv", "")

@@ -106,7 +106,35 @@ def _b_funcaptcha(site_key: str, url: str, extra: dict) -> dict:
     p = {"method": "funcaptcha", "publickey": site_key, "pageurl": url}
     if extra.get("surl"):
         p["surl"] = extra["surl"]
+    blob = _arkose_blob(extra)
+    if blob:
+        # 2captcha wants the data-exchange blob wrapped, not raw: a bare blob
+        # comes back ERROR_DATA. Sites that gate Arkose on a per-session blob
+        # (Figma among them) are unsolvable without it.
+        p["data"] = blob
+    if extra.get("user_agent") or extra.get("userAgent"):
+        p["userAgent"] = extra.get("user_agent") or extra.get("userAgent")
     return p
+
+
+def _arkose_blob(extra: dict) -> str:
+    """Return the Arkose data-exchange blob as the JSON wrapper solvers expect.
+
+    Accepts either ``blob`` (raw, wrapped here) or a ``data`` value that is
+    already wrapped, so a caller that knows the exact payload can pass it
+    through untouched.
+    """
+    import json as _json
+
+    data = extra.get("data")
+    if isinstance(data, str) and data.strip():
+        return data
+    if isinstance(data, dict) and data:
+        return _json.dumps(data)
+    blob = extra.get("blob") or extra.get("data_exchange_blob") or extra.get("dataExchangeBlob")
+    if isinstance(blob, str) and blob.strip():
+        return _json.dumps({"blob": blob})
+    return ""
 
 
 def _b_geetest(_site_key: str, url: str, extra: dict) -> dict:

@@ -229,9 +229,15 @@ SCHEMA_SOLVE_CAPTCHA = {
         "site_key": {"type": "string", "description": "Public site key / pkey / sitekey. Empty for image/geetest/datadome (use extra)."},
         "url": {"type": "string", "description": "Page URL where the captcha lives."},
         "extra": {"type": "object",
-                  "description": "Kind-specific extras (action, min_score, gt, challenge, captcha_url, body, iv, context, user_id, etc.). See plugin README.",
+                  "description": (
+                      "Kind-specific extras. funcaptcha: surl and blob (the Arkose "
+                      "data-exchange blob — sites that gate on it are unsolvable "
+                      "without it; pass it raw, it gets wrapped for you). Others: "
+                      "action, min_score, gt, challenge, captcha_url, body, iv, "
+                      "context, user_id. See plugin README."
+                  ),
                   "default": {}},
-        "provider": {"type": "string", "enum": ["auto", "capsolver", "2captcha"],
+        "provider": {"type": "string", "enum": ["auto", "capsolver", "2captcha", "anticaptcha"],
                      "description": "Force a specific backend. Default = auto (router picks).",
                      "default": "auto"},
     },

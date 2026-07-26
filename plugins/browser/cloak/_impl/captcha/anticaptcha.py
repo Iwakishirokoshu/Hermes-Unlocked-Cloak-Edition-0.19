@@ -82,8 +82,9 @@ def _build_task(kind: str, site_key: str, url: str, extra: dict) -> dict:
         if surl:
             # Anti-Captcha wants the bare subdomain, not the full URL.
             task["funcaptchaApiJSSubdomain"] = _hostname(surl)
-        if extra.get("data"):
-            task["data"] = extra["data"]
+        blob = _arkose_blob(extra)
+        if blob:
+            task["data"] = blob
         return task
 
     if kind in ("geetest", "geetest_v4"):
@@ -130,6 +131,21 @@ def _build_task(kind: str, site_key: str, url: str, extra: dict) -> dict:
             task["isInvisible"] = True
 
     return task
+
+
+def _arkose_blob(extra: dict) -> str:
+    """Arkose data-exchange blob, wrapped the way solvers expect it."""
+    import json as _json
+
+    data = extra.get("data")
+    if isinstance(data, str) and data.strip():
+        return data
+    if isinstance(data, dict) and data:
+        return _json.dumps(data)
+    blob = extra.get("blob") or extra.get("data_exchange_blob") or extra.get("dataExchangeBlob")
+    if isinstance(blob, str) and blob.strip():
+        return _json.dumps({"blob": blob})
+    return ""
 
 
 def _hostname(value: str) -> str:

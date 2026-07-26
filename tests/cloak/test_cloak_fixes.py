@@ -2199,3 +2199,48 @@ def test_detector_reads_the_arkose_key_from_the_enforcement_url():
     # Scripts count, not just iframes: the script loads first.
     assert 'script[src*="arkose" i]' in _DETECT_JS
     assert "arkoseConfig" in _DETECT_JS
+
+
+def test_arkose_blob_reaches_every_solver():
+    """Sites that gate Arkose on a per-session data-exchange blob are simply
+    unsolvable without it, and 2captcha rejects a bare blob with ERROR_DATA —
+    it has to arrive wrapped."""
+    import json as _json
+    from plugins.browser.cloak._impl.captcha.twocaptcha import _b_funcaptcha
+    from plugins.browser.cloak._impl.captcha.anticaptcha import _build_task as anti_task
+    from plugins.browser.cloak._impl.captcha.capsolver import _build_task as cap_task
+
+    extra = {"blob": "BLOB-XYZ", "surl": "https://figma-api.arkoselabs.com"}
+
+    two = _b_funcaptcha("PKEY", "https://www.figma.com/signup", extra)
+    assert two["data"] == _json.dumps({"blob": "BLOB-XYZ"})
+    assert two["surl"] == "https://figma-api.arkoselabs.com"
+
+    anti = anti_task("funcaptcha", "PKEY", "https://www.figma.com/signup", extra)
+    assert anti["data"] == _json.dumps({"blob": "BLOB-XYZ"})
+    assert anti["funcaptchaApiJSSubdomain"] == "figma-api.arkoselabs.com"
+
+    cap = cap_task("funcaptcha", "PKEY", "https://www.figma.com/signup", extra)
+    assert cap["data"] == _json.dumps({"blob": "BLOB-XYZ"})
+
+    # An already-wrapped payload passes through untouched.
+    prewrapped = {"data": _json.dumps({"blob": "RAW"})}
+    assert _b_funcaptcha("K", "u", prewrapped)["data"] == _json.dumps({"blob": "RAW"})
+    # No blob at all: the field is simply absent, not an empty string.
+    assert "data" not in _b_funcaptcha("K", "u", {})
+
+
+def test_funcaptcha_tries_2captcha_before_capsolver():
+    """CapSolver rejects some Arkose public keys outright, so leading with it
+    spends a round trip to learn nothing."""
+    from plugins.browser.cloak._impl.captcha import router as r
+
+    assert r._PREFERRED["funcaptcha"] == ["2captcha", "anticaptcha", "capsolver"]
+
+
+def test_solve_schema_offers_every_wired_provider():
+    from plugins.browser.cloak._impl.tools_manage import SCHEMA_SOLVE_CAPTCHA
+
+    providers = SCHEMA_SOLVE_CAPTCHA["properties"]["provider"]["enum"]
+    assert providers == ["auto", "capsolver", "2captcha", "anticaptcha"]
+    assert "blob" in SCHEMA_SOLVE_CAPTCHA["properties"]["extra"]["description"]

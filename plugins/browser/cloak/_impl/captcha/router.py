@@ -49,7 +49,10 @@ _PREFERRED: dict[str, list[str]] = {
     "recaptcha_enterprise": ["capsolver", "2captcha", "anticaptcha"],
     "hcaptcha": ["capsolver", "2captcha", "anticaptcha"],  # CapSolver wins big here
     "turnstile": ["capsolver", "2captcha", "anticaptcha"],
-    "funcaptcha": ["capsolver", "2captcha", "anticaptcha"],
+    # Arkose: 2captcha first. CapSolver rejects some public keys outright
+    # (ERROR_INVALID_TASK_DATA) — Figma's among them — so trying it first
+    # spends a round trip to learn nothing.
+    "funcaptcha": ["2captcha", "anticaptcha", "capsolver"],
     "amazon_waf": ["capsolver", "2captcha"],
     "friendly_captcha": ["capsolver", "2captcha"],
     "friendly": ["capsolver", "2captcha"],
