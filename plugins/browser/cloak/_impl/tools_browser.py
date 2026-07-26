@@ -82,7 +82,8 @@ async def _navigate_via_cloak_inner(url: str, cdp_url: str) -> str:
                     await asyncio.sleep(settle_ms / 1000)
 
                 meta = await _page_meta(client.page)
-                return _nav_result(url, cdp_url, meta, attempt)
+                captcha = await _scan_for_captcha(client.page)
+                return _nav_result(url, cdp_url, meta, attempt, captcha=captcha)
         except Exception as exc:  # noqa: BLE001
             last_error = exc
             if _should_retry_navigation(exc) and attempt < attempts:
@@ -169,12 +170,35 @@ def _should_retry_navigation(exc: Exception) -> bool:
     return any(marker in text for marker in transient_markers)
 
 
+async def _scan_for_captcha(page: Any) -> dict[str, Any] | None:
+    """Report a challenge on the page we just landed on.
+
+    Folding this into the navigation result means the agent is told about a
+    captcha at the moment it appears, instead of having to remember to ask.
+    Off with CLOAK_AUTODETECT_CAPTCHA=0. Never raises: a failed scan must
+    not turn a good navigation into an error.
+    """
+    if os.environ.get("CLOAK_AUTODETECT_CAPTCHA", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return None
+    try:
+        from .captcha import detect_in_playwright_page
+
+        found = await detect_in_playwright_page(page)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("post-navigation captcha scan skipped: %s", redact_cdp_url(exc))
+        return None
+    if not isinstance(found, dict) or (not found.get("kind") and not found.get("pending")):
+        return None
+    return found
+
+
 def _nav_result(
     requested_url: str,
     cdp_url: str,
     meta: dict[str, Any],
     attempt: int,
     warning: str | None = None,
+    captcha: dict[str, Any] | None = None,
 ) -> str:
     result: dict[str, Any] = {
         "ok": True,
@@ -190,6 +214,14 @@ def _nav_result(
     }
     if warning:
         result["warning"] = warning
+    if captcha:
+        result["captcha"] = captcha
+        result["next_step"] = (
+            "A challenge is still loading. Call cloak_detect_captcha(wait_ms=15000) "
+            "before acting on this page."
+            if captcha.get("pending") and not captcha.get("kind")
+            else "Captcha detected. Solve it with cloak_solve_captcha before continuing."
+        )
     if _is_outlook_marketing_redirect(requested_url, result):
         result["warning"] = (
             "outlook_inbox_deeplink_landed_on_microsoft_marketing_page; "

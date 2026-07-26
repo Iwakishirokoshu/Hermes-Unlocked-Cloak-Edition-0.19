@@ -5,6 +5,7 @@ Run from repo root:
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 from pathlib import Path
@@ -1946,3 +1947,110 @@ def test_detect_stops_once_the_page_reads_clean_twice(monkeypatch):
     assert out["pending"] is False
     assert seen["n"] == 3, "should stop on the second consecutive clean read"
     assert out["waited_ms"] < 30000
+
+
+def test_anticaptcha_builds_the_documented_task_shapes():
+    """Third solver alongside CapSolver and 2captcha."""
+    from plugins.browser.cloak._impl.captcha.anticaptcha import (
+        AntiCaptchaError, SUPPORTED_KINDS, _build_task, _extract_token, _hostname,
+    )
+
+    assert {"funcaptcha", "hcaptcha", "turnstile", "recaptcha_v2"} <= set(SUPPORTED_KINDS)
+
+    arkose = _build_task("funcaptcha", "PKEY", "https://figma.com/signup",
+                         {"surl": "https://client-api.arkoselabs.com/x"})
+    assert arkose["type"] == "FunCaptchaTaskProxyless"
+    assert arkose["websitePublicKey"] == "PKEY"
+    # Anti-Captcha wants the bare subdomain, not the URL it was found at.
+    assert arkose["funcaptchaApiJSSubdomain"] == "client-api.arkoselabs.com"
+    assert _hostname("https://a.b.c/d/e") == "a.b.c"
+
+    v3 = _build_task("recaptcha_v3", "KEY", "https://x.test", {"action": "signup", "min_score": 0.9})
+    assert v3["minScore"] == 0.9 and v3["pageAction"] == "signup"
+
+    turnstile = _build_task("turnstile", "0x4", "https://x.test", {"action": "login", "data": "cd"})
+    assert turnstile["action"] == "login" and turnstile["cData"] == "cd"
+
+    assert _extract_token("funcaptcha", {"gRecaptchaResponse": "tok"}) == "tok"
+    assert _extract_token("image", {"text": "abc"}) == "abc"
+
+    # A missing site key is caught here, not sent to the API as an empty string.
+    with pytest.raises(AntiCaptchaError):
+        _build_task("hcaptcha", "", "https://x.test", {})
+    with pytest.raises(AntiCaptchaError):
+        _build_task("kasada", "k", "https://x.test", {})
+
+
+def test_anticaptcha_surfaces_in_band_errors():
+    from plugins.browser.cloak._impl.captcha.anticaptcha import AntiCaptchaError, _raise_for_error
+
+    _raise_for_error({"errorId": 0, "taskId": 7}, "createTask")  # no raise
+    with pytest.raises(AntiCaptchaError) as excinfo:
+        _raise_for_error(
+            {"errorId": 1, "errorCode": "ERROR_ZERO_BALANCE", "errorDescription": "no funds"},
+            "createTask",
+        )
+    assert "ERROR_ZERO_BALANCE" in str(excinfo.value)
+
+
+def test_router_knows_all_three_providers(monkeypatch):
+    from plugins.browser.cloak._impl.captcha import router as r
+
+    assert set(r._CLIENTS) == {"2captcha", "capsolver", "anticaptcha"}
+    assert "anticaptcha" in r._PREFERRED["funcaptcha"]
+    assert "anticaptcha" in r._PREFERRED["hcaptcha"]
+    # Kinds Anti-Captcha cannot do must not list it.
+    assert "anticaptcha" not in r._PREFERRED["kasada"]
+
+    monkeypatch.setenv("CAPTCHA_PROVIDER", "anticaptcha")
+    assert r.CaptchaRouter().override == "anticaptcha"
+    monkeypatch.setenv("CAPTCHA_PROVIDER", "anti-captcha")
+    assert r.CaptchaRouter().override == "anticaptcha"
+    monkeypatch.setenv("CAPTCHA_PROVIDER", "nonsense")
+    assert r.CaptchaRouter().override == "auto"
+
+
+def test_navigation_reports_a_captcha_without_being_asked(monkeypatch):
+    """The agent kept walking into challenge pages because nothing told it one
+    was there — it had to remember to call the detector itself."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_browser as tb
+
+    monkeypatch.delenv("CLOAK_AUTODETECT_CAPTCHA", raising=False)
+
+    async def fake_detect(page):
+        return {"kind": "funcaptcha", "site_key": "PKEY", "pending": False,
+                "page_url": "https://figma.com/signup", "extra": {}, "confidence": "high"}
+
+    import plugins.browser.cloak._impl.captcha as captcha_pkg
+    monkeypatch.setattr(captcha_pkg, "detect_in_playwright_page", fake_detect)
+
+    found = asyncio.run(tb._scan_for_captcha(object()))
+    assert found and found["kind"] == "funcaptcha"
+
+    out = json.loads(tb._nav_result("https://figma.com/signup", "ws://x", {}, 1, captcha=found))
+    assert out["captcha"]["site_key"] == "PKEY"
+    assert "cloak_solve_captcha" in out["next_step"]
+
+    # Pending reads differently: wait, do not try to solve nothing.
+    pending = {"kind": None, "pending": True, "extra": {}, "site_key": None}
+    out2 = json.loads(tb._nav_result("https://figma.com/signup", "ws://x", {}, 1, captcha=pending))
+    assert "wait_ms" in out2["next_step"]
+
+    # A clean page adds nothing.
+    out3 = json.loads(tb._nav_result("https://example.test", "ws://x", {}, 1))
+    assert "captcha" not in out3 and "next_step" not in out3
+
+
+def test_captcha_autodetect_can_be_turned_off(monkeypatch):
+    import asyncio
+    from plugins.browser.cloak._impl import tools_browser as tb
+
+    monkeypatch.setenv("CLOAK_AUTODETECT_CAPTCHA", "0")
+
+    def explode(page):
+        raise AssertionError("scan must not run when the switch is off")
+
+    import plugins.browser.cloak._impl.captcha as captcha_pkg
+    monkeypatch.setattr(captcha_pkg, "detect_in_playwright_page", explode)
+    assert asyncio.run(tb._scan_for_captcha(object())) is None

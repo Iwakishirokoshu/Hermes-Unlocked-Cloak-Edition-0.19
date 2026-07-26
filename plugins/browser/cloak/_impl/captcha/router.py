@@ -2,7 +2,8 @@
 
 Picks the best backend per ``kind`` based on:
 
-1. ``CAPTCHA_PROVIDER`` env var (``capsolver`` | ``2captcha`` | ``auto``).
+1. ``CAPTCHA_PROVIDER`` env var (``capsolver`` | ``2captcha`` | ``anticaptcha``
+   | ``auto``).
 2. Per-kind preference table — derived from real-world test matrix in
    captcha-solver SKILL.md, e.g.:
      * hCaptcha — CapSolver is dramatically better.
@@ -30,6 +31,11 @@ from .capsolver import (
     CapSolverError,
     SUPPORTED_KINDS as _CAP_KINDS,
 )
+from .anticaptcha import (
+    AntiCaptchaClient,
+    AntiCaptchaError,
+    SUPPORTED_KINDS as _ANTI_KINDS,
+)
 
 log = logging.getLogger("cloak.captcha.router")
 
@@ -38,26 +44,26 @@ log = logging.getLogger("cloak.captcha.router")
 # first; on failure (or missing key) the next is tried. Kinds absent from
 # both lists raise MANUAL_INTERVENTION_REQUIRED immediately.
 _PREFERRED: dict[str, list[str]] = {
-    "recaptcha_v2": ["capsolver", "2captcha"],
-    "recaptcha_v3": ["capsolver", "2captcha"],
-    "recaptcha_enterprise": ["capsolver", "2captcha"],
-    "hcaptcha": ["capsolver", "2captcha"],  # CapSolver wins big here
-    "turnstile": ["capsolver", "2captcha"],
-    "funcaptcha": ["capsolver", "2captcha"],
+    "recaptcha_v2": ["capsolver", "2captcha", "anticaptcha"],
+    "recaptcha_v3": ["capsolver", "2captcha", "anticaptcha"],
+    "recaptcha_enterprise": ["capsolver", "2captcha", "anticaptcha"],
+    "hcaptcha": ["capsolver", "2captcha", "anticaptcha"],  # CapSolver wins big here
+    "turnstile": ["capsolver", "2captcha", "anticaptcha"],
+    "funcaptcha": ["capsolver", "2captcha", "anticaptcha"],
     "amazon_waf": ["capsolver", "2captcha"],
     "friendly_captcha": ["capsolver", "2captcha"],
     "friendly": ["capsolver", "2captcha"],
     "keycaptcha": ["capsolver", "2captcha"],
     "datadome": ["capsolver", "2captcha"],
     "lemin": ["capsolver", "2captcha"],
-    "image": ["capsolver", "2captcha"],
+    "image": ["capsolver", "2captcha", "anticaptcha"],
     # CapSolver-only:
     "kasada": ["capsolver"],
     "akamai": ["capsolver"],
     "imperva": ["capsolver"],
     # 2captcha-only:
-    "geetest": ["2captcha"],
-    "geetest_v4": ["2captcha"],
+    "geetest": ["2captcha", "anticaptcha"],
+    "geetest_v4": ["2captcha", "anticaptcha"],
     "mtcaptcha": ["2captcha"],
     "cybersiara": ["2captcha"],
     "cutcaptcha": ["2captcha"],
@@ -82,11 +88,14 @@ class CaptchaRouter:
         # Force a specific provider via env or constructor arg.
         env_override = os.environ.get("CAPTCHA_PROVIDER", "auto").lower().strip()
         self.override = (override_provider or env_override).lower().strip()
-        if self.override not in {"auto", "capsolver", "2captcha", "twocaptcha"}:
+        if self.override not in {"auto", "capsolver", "2captcha", "twocaptcha",
+                                 "anticaptcha", "anti-captcha"}:
             log.warning("Unknown CAPTCHA_PROVIDER=%r, falling back to auto", self.override)
             self.override = "auto"
         if self.override == "twocaptcha":
             self.override = "2captcha"
+        if self.override == "anti-captcha":
+            self.override = "anticaptcha"
 
     async def solve(
         self,
@@ -107,6 +116,8 @@ class CaptchaRouter:
             candidates = _PREFERRED.get(kind, [])
         elif self.override == "capsolver":
             candidates = ["capsolver"] if kind in _CAP_KINDS else []
+        elif self.override == "anticaptcha":
+            candidates = ["anticaptcha"] if kind in _ANTI_KINDS else []
         else:  # 2captcha
             candidates = ["2captcha"] if kind in _TWO_KINDS else []
 
@@ -125,7 +136,7 @@ class CaptchaRouter:
                         raise RuntimeError("empty token")
                     log.info("captcha solve OK kind=%s provider=%s", kind, provider)
                     return token
-            except (TwoCaptchaError, CapSolverError) as err:
+            except (TwoCaptchaError, CapSolverError, AntiCaptchaError) as err:
                 # Soft fail — try next provider.
                 log.warning("captcha provider %s failed: %s", provider, err)
                 last_err = err
@@ -155,7 +166,12 @@ def _make_cap() -> CapSolverClient:
     return CapSolverClient()
 
 
+def _make_anti() -> AntiCaptchaClient:
+    return AntiCaptchaClient()
+
+
 _CLIENTS = {
     "2captcha": _make_two,
     "capsolver": _make_cap,
+    "anticaptcha": _make_anti,
 }

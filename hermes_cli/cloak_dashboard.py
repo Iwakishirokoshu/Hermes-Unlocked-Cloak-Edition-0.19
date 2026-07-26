@@ -39,12 +39,14 @@ _CAPTCHA_FIELDS: Dict[str, List[str]] = {
     # ui field        -> env var(s) written
     "capsolver": ["CAPSOLVER_API_KEY"],
     "twocaptcha": ["TWO_CAPTCHA_API_KEY", "TWOCAPTCHA_API_KEY"],
+    "anticaptcha": ["ANTICAPTCHA_API_KEY", "ANTI_CAPTCHA_API_KEY"],
     "notletters": ["NOTLETTERS_API_KEY"],
 }
 # Read-back: ui field -> first env var to display presence/mask for.
 _CAPTCHA_READ: Dict[str, str] = {
     "capsolver": "CAPSOLVER_API_KEY",
     "twocaptcha": "TWO_CAPTCHA_API_KEY",
+    "anticaptcha": "ANTICAPTCHA_API_KEY",
     "notletters": "NOTLETTERS_API_KEY",
 }
 
@@ -461,7 +463,7 @@ def cloak_captcha_save(payload: Dict[str, Any] = Body(default={})) -> JSONRespon
 
     if "provider" in payload:
         provider = (payload.get("provider") or "auto").strip().lower()
-        if provider not in {"auto", "capsolver", "2captcha", "twocaptcha"}:
+        if provider not in {"auto", "capsolver", "2captcha", "twocaptcha", "anticaptcha"}:
             provider = "auto"
         updates["CAPTCHA_PROVIDER"] = provider
         changed.append("provider")
