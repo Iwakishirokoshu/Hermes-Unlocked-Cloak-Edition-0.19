@@ -441,6 +441,7 @@ async def _launch_profile(
         old_cdp = str((binding_before or {}).get("cdp_url") or "")
         if old_cdp and cdp_abs and old_cdp != cdp_abs:
             await get_pool().drop(old_cdp)
+            _reset_native_browser_session(task_id, "profile changed")
 
         try:
             status_after = await mgr.profile_status(profile_id)
@@ -779,6 +780,10 @@ async def cloak_stop(args: dict, **kw: Any) -> Dict[str, Any]:
         "already_stopped": already_stopped,
     }
     result.update(_stop_cdp_supervisor(task_id, profile_id))
+    if binding is None or binding.get("profile_id") == profile_id:
+        result["native_session_reset"] = _reset_native_browser_session(
+            task_id, "profile stopped"
+        )
     try:
         from .. import session_leases
 
@@ -942,6 +947,35 @@ def _profile_switch_allowed(explicit: Optional[bool]) -> bool:
 
 def _binding_points_at(binding: Optional[Dict[str, Any]], profile_id: str) -> bool:
     return bool(binding) and str((binding or {}).get("profile_id") or "") == str(profile_id)
+
+
+def _reset_native_browser_session(task_id: Any, reason: str) -> bool:
+    """Drop the agent-browser session bound to this task.
+
+    agent-browser keeps its own session cache, independent of the provider
+    lease, of ``BROWSER_CDP_URL`` and of the CDP supervisor. Pointing the task
+    at a different profile without dropping that session leaves the binary
+    talking to the previous profile's CDP endpoint — and Manager answers a
+    websocket upgrade on a stopped profile with ``403 Forbidden``.
+
+    That is the loop the agent could not escape: navigation failed, so it built
+    yet another profile, launched it, navigated again through the same cached
+    session, and failed again. Nothing it could do from the model side
+    invalidated that cache.
+    """
+    key = profile_state.task_key(task_id)
+    try:
+        from tools.browser_tool import cleanup_browser
+
+        cleanup_browser(key)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Could not reset the native browser session for task %s (%s): %s",
+            key, reason, redact_cdp_url(exc),
+        )
+        return False
+    logger.info("Reset native browser session for task %s (%s)", key, reason)
+    return True
 
 
 def _stop_cdp_supervisor(task_id: Any, profile_id: str) -> Dict[str, Any]:
