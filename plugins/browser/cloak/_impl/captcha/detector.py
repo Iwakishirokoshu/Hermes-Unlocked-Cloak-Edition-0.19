@@ -30,6 +30,11 @@ _DETECT_JS = r"""
 (() => {
   const out = { kind: null, site_key: null, page_url: location.href, extra: {}, confidence: "high" };
   const $ = (sel) => document.querySelector(sel);
+  // Documents with an opaque origin (about:blank, data:, sandboxed frames, a
+  // page left in an error state) throw SecurityError on document.cookie. Read
+  // it once behind a guard: a blocked cookie jar must not abort the whole scan
+  // and turn "no captcha here" into a tool error.
+  const cookies = (() => { try { return document.cookie || ""; } catch (e) { return ""; } })();
 
   // --- Cloudflare interstitial (full block, not just embedded Turnstile) ---
   const html = document.documentElement.outerHTML.toLowerCase();
@@ -140,7 +145,7 @@ _DETECT_JS = r"""
   // --- DataDome ---
   if ($('script[src*="datadome"], script[src*="dd-js"]') ||
       $('iframe[src*="datadome"], iframe[src*="captcha.datadome"]') ||
-      document.cookie.includes("datadome")) {
+      cookies.includes("datadome")) {
     out.kind = "datadome";
     const dIframe = $('iframe[src*="datadome"], iframe[src*="captcha.datadome"]');
     if (dIframe) out.extra.captcha_url = dIframe.src;
@@ -160,7 +165,7 @@ _DETECT_JS = r"""
 
   // --- Imperva / Incapsula ---
   if ($('script[src*="incapsula"], script[src*="imperva"]') ||
-      document.cookie.includes("incap_ses") || document.cookie.includes("visid_incap")) {
+      cookies.includes("incap_ses") || cookies.includes("visid_incap")) {
     out.kind = "imperva"; out.confidence = "low"; return out;
   }
 

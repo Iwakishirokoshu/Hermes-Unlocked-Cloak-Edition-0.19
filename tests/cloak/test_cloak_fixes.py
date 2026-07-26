@@ -1416,3 +1416,23 @@ def test_idle_reaper_returns_the_pooled_proxy(tmp_path, monkeypatch):
 
     # Idempotent, and never raises for a profile that holds nothing.
     assert idle_reaper._release_pool_claim("profile-uuid", "acc-idle") == 0
+
+
+def test_captcha_detector_survives_a_blocked_cookie_jar():
+    """document.cookie throws SecurityError on opaque-origin documents
+    (about:blank, data:, sandboxed frames, a page left in an error state). An
+    unguarded read aborted the whole scan, so cloak_detect_captcha returned a
+    tool error instead of "no captcha here"."""
+    import re
+    from plugins.browser.cloak._impl.captcha.detector import _DETECT_JS
+
+    guarded = re.search(r"const cookies = \(\(\) => \{ try \{ return document\.cookie", _DETECT_JS)
+    assert guarded, "the cookie jar must be read once behind a try/catch"
+
+    # No other place may touch document.cookie directly (comments aside).
+    code = "\n".join(
+        line for line in _DETECT_JS.splitlines() if not line.strip().startswith("//")
+    )
+    reads = re.findall(r"document\.cookie", code)
+    assert len(reads) == 1, f"unguarded document.cookie reads remain: {len(reads)}"
+    assert "cookies.includes(" in _DETECT_JS
