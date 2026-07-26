@@ -37,13 +37,17 @@ def test_skill_forbids_churning_profiles() -> None:
     assert "name-001" in text
 
 
-def test_skill_keeps_proxy_credentials_out_of_the_transcript() -> None:
+def test_skill_documents_both_proxy_paths() -> None:
+    """A pasted proxy and the shared pool are both first-class. The operator
+    picks; the skill must not push one over the other."""
     text = SKILL.read_text(encoding="utf-8")
 
+    assert 'proxy="socks5://user:pass@host:1080"' in text
     assert "use_pool=true" in text
     assert 'cloak_proxy_pool(action="add"' in text
-    assert "осядет в истории" in text
+    assert "всегда сильнее пула" in text
     assert "proxy_unavailable" in text
+    assert "socks4" in text
     # The manual reserve/release dance is no longer the documented path.
     assert 'cloak_proxy_pool(action="next")' not in text
 
