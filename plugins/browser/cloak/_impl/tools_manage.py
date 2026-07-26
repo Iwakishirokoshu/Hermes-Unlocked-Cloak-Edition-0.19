@@ -374,7 +374,18 @@ async def _launch_profile(
                     "already_running": True,
                 }
             else:
-                return {"error": redact_cdp_url(exc), "status_code": exc.status_code}
+                out: Dict[str, Any] = {
+                    "error": redact_cdp_url(exc),
+                    "status_code": exc.status_code,
+                }
+                # The remembered profile is gone from Manager (deleted out of
+                # band, or the profile store was reset). Drop the binding so the
+                # next call starts clean instead of re-launching a ghost every
+                # time a browser tool fires.
+                if exc.status_code == 404 and _binding_points_at(binding_before, profile_id):
+                    profile_state.clear_binding(task_id, profile_id=profile_id)
+                    out["stale_binding_cleared"] = True
+                return out
 
         launched_profile_id = str(resp.get("profile_id") or profile_id)
         if launched_profile_id != profile_id:
@@ -708,6 +719,7 @@ async def cloak_stop(args: dict, **kw: Any) -> Dict[str, Any]:
         "stopped": True,
         "already_stopped": already_stopped,
     }
+    result.update(_stop_cdp_supervisor(task_id, profile_id))
     try:
         from .. import session_leases
 
@@ -846,6 +858,43 @@ async def _resolve_profile_id(
     if existing is None:
         raise ManagerError(404, value, "profile not found by name")
     return existing["id"]
+
+
+def _binding_points_at(binding: Optional[Dict[str, Any]], profile_id: str) -> bool:
+    return bool(binding) and str((binding or {}).get("profile_id") or "") == str(profile_id)
+
+
+def _stop_cdp_supervisor(task_id: Any, profile_id: str) -> Dict[str, Any]:
+    """Tear down the CDP supervisor that was watching the stopped profile.
+
+    Hermes keeps one supervisor per task, holding a live websocket to the
+    profile's CDP endpoint. Stopping the profile leaves that socket pointed at
+    a dead endpoint, and Manager answers a websocket upgrade on a stopped
+    profile with ``403 Forbidden`` (plain HTTP gets ``404``). The supervisor
+    then retries the dead URL for every later ``browser_*`` call, so the agent
+    sees an unexplained 403 loop instead of "nothing is running, launch one".
+
+    Only the supervisor actually bound to *this* profile is stopped — another
+    profile in the same task must keep running.
+    """
+    key = profile_state.task_key(task_id)
+    try:
+        from tools.browser_supervisor import SUPERVISOR_REGISTRY
+
+        supervisor = SUPERVISOR_REGISTRY.get(key)
+        if supervisor is None:
+            return {}
+        if profile_id and profile_id not in str(getattr(supervisor, "cdp_url", "")):
+            return {}
+        SUPERVISOR_REGISTRY.stop(key)
+        logger.info("Stopped CDP supervisor for task %s (profile %s)", key, profile_id)
+        return {"cdp_supervisor_stopped": True}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Profile %s stopped but its CDP supervisor could not be torn down: %s",
+            profile_id, redact_cdp_url(exc),
+        )
+        return {"cdp_supervisor_error": redact_cdp_url(exc)}
 
 
 def _is_already_stopped(exc: ManagerError) -> bool:

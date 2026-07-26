@@ -1436,3 +1436,55 @@ def test_captcha_detector_survives_a_blocked_cookie_jar():
     reads = re.findall(r"document\.cookie", code)
     assert len(reads) == 1, f"unguarded document.cookie reads remain: {len(reads)}"
     assert "cookies.includes(" in _DETECT_JS
+
+
+def test_cloak_stop_tears_down_the_matching_cdp_supervisor(monkeypatch):
+    """Hermes keeps one CDP supervisor per task holding a live websocket. Manager
+    answers a websocket upgrade on a stopped profile with 403, so leaving the
+    supervisor up turns every later browser_* call into an unexplained 403 loop."""
+    import sys
+    import types
+
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    stopped: list = []
+
+    class FakeSupervisor:
+        def __init__(self, cdp_url):
+            self.cdp_url = cdp_url
+
+    class FakeRegistry:
+        def __init__(self, supervisor):
+            self._s = supervisor
+
+        def get(self, task_id):
+            return self._s
+
+        def stop(self, task_id):
+            stopped.append(task_id)
+
+    def install(supervisor):
+        # tools.browser_supervisor pulls in `websockets`, which the unit env
+        # does not install; the production import is lazy, so stub the module.
+        module = types.ModuleType("tools.browser_supervisor")
+        module.SUPERVISOR_REGISTRY = FakeRegistry(supervisor)
+        monkeypatch.setitem(sys.modules, "tools.browser_supervisor", module)
+
+    install(FakeSupervisor("ws://bridge:8081/api/profiles/prof-1/cdp"))
+    assert tm._stop_cdp_supervisor("task-a", "prof-1") == {"cdp_supervisor_stopped": True}
+    assert stopped == ["task-a"]
+
+    # A supervisor bound to a different profile in the same task is left alone.
+    stopped.clear()
+    install(FakeSupervisor("ws://bridge:8081/api/profiles/prof-2/cdp"))
+    assert tm._stop_cdp_supervisor("task-a", "prof-1") == {}
+    assert stopped == []
+
+
+def test_launch_drops_a_binding_whose_profile_is_gone():
+    from plugins.browser.cloak._impl.tools_manage import _binding_points_at
+
+    assert _binding_points_at({"profile_id": "p1"}, "p1")
+    assert not _binding_points_at({"profile_id": "p2"}, "p1")
+    assert not _binding_points_at(None, "p1")
+    assert not _binding_points_at({}, "p1")
