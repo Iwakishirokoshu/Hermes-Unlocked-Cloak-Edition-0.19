@@ -110,7 +110,33 @@ _DETECT_JS = r"""
   const fScript = $('script[src*="arkose"], script[src*="funcaptcha"], script[src*="arkoselabs"]');
   const fIframe = $('iframe[src*="arkose"], iframe[src*="funcaptcha"], iframe[title*="arkose" i], iframe[name*="arkose" i], iframe[id*="arkose" i], iframe[title*="funcaptcha" i]');
   if (fDiv || fScript || fIframe) {
-    const pkey = (fDiv && (fDiv.getAttribute("data-pkey") || fDiv.getAttribute("data-public-key"))) || null;
+    // The public key is what a solver actually needs, and sites rarely put it
+    // in a data- attribute. Arkose carries it in the enforcement URL instead:
+    //   https://client-api.arkoselabs.com/v2/<PUBLIC_KEY>/api.js
+    //   .../fc/api/nojs/?pkey=<PUBLIC_KEY>
+    // Reading only data-pkey meant the challenge was found but never solvable.
+    const findPkey = () => {
+      const attr = fDiv && (fDiv.getAttribute("data-pkey") || fDiv.getAttribute("data-public-key"));
+      if (attr) return attr;
+      const urls = [];
+      const push = (el) => { const v = el && el.getAttribute("src"); if (v) urls.push(v); };
+      Array.prototype.forEach.call(
+        document.querySelectorAll('script[src*="arkose" i], script[src*="funcaptcha" i], iframe[src*="arkose" i], iframe[src*="funcaptcha" i]'),
+        push);
+      for (const u of urls) {
+        const v2 = u.match(/\/v2\/([A-Za-z0-9-]{8,})\//);
+        if (v2) return v2[1];
+        const qs = u.match(/[?&](?:public_key|pkey)=([A-Za-z0-9-]{8,})/i);
+        if (qs) return qs[1];
+      }
+      // Some embeds stash it on window for their own callback wiring.
+      try {
+        const w = window.arkoseConfig || window.funCaptchaConfig || null;
+        if (w && (w.public_key || w.publicKey)) return w.public_key || w.publicKey;
+      } catch (e) {}
+      return null;
+    };
+    const pkey = findPkey();
     const frameSrc = (fIframe && fIframe.getAttribute("src")) || "";
     const hasVendorSrc = /arkose|funcaptcha/i.test(frameSrc);
     // A solver needs the public key. Without one — enforcement script only, or

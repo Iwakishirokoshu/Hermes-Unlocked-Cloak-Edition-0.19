@@ -2183,3 +2183,19 @@ def test_a_pending_banner_in_a_subframe_is_not_lost():
     assert out["pending"] is True
     assert out["extra"]["in_iframe"] is True
     assert out["page_url"] == "https://www.figma.com/education/"
+
+
+def test_detector_reads_the_arkose_key_from_the_enforcement_url():
+    """Sites rarely expose data-pkey. Arkose carries the public key in the
+    enforcement URL, and a solver cannot take the task without it — so the
+    challenge was found and then never solvable."""
+    from plugins.browser.cloak._impl.captcha.detector import _DETECT_JS
+
+    assert "findPkey" in _DETECT_JS
+    # .../v2/<PUBLIC_KEY>/api.js
+    assert r"/\/v2\/([A-Za-z0-9-]{8,})\//" in _DETECT_JS
+    # ...?pkey=<PUBLIC_KEY> / ?public_key=<PUBLIC_KEY>
+    assert "public_key|pkey" in _DETECT_JS
+    # Scripts count, not just iframes: the script loads first.
+    assert 'script[src*="arkose" i]' in _DETECT_JS
+    assert "arkoseConfig" in _DETECT_JS
