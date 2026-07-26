@@ -1775,3 +1775,174 @@ def test_provider_keeps_a_lease_whose_profile_still_runs(monkeypatch):
     session = provider.create_session("t3")
     assert session["cdp_url"] == "ws://alive/cdp"
     assert session["features"].get("reused_lease") is True
+
+
+class _FakeFrame:
+    def __init__(self, url, result=None, boom=False):
+        self.url = url
+        self._result = result
+        self._boom = boom
+
+    async def evaluate(self, js):
+        if self._boom:
+            raise RuntimeError("frame detached")
+        return self._result or {"kind": None, "site_key": None,
+                                "page_url": self.url, "extra": {}, "confidence": "high"}
+
+
+class _FakePage:
+    def __init__(self, frames):
+        self.frames = frames
+
+    async def evaluate(self, js):
+        raise AssertionError("frame-aware scan must not fall back to page.evaluate")
+
+
+def test_captcha_scan_reaches_into_iframes():
+    """Arkose, hCaptcha and reCAPTCHA all render inside an iframe, and the top
+    document cannot even read a cross-origin one — so a main-frame-only scan
+    reported "no captcha" on exactly the pages that had one."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    page = _FakePage([
+        _FakeFrame("https://www.figma.com/signup"),
+        _FakeFrame("https://client-api.arkoselabs.com/challenge", {
+            "kind": "funcaptcha", "site_key": "PKEY-123",
+            "page_url": "https://client-api.arkoselabs.com/challenge",
+            "extra": {"surl": "https://client-api.arkoselabs.com"}, "confidence": "high",
+        }),
+    ])
+    out = asyncio.run(detect_in_playwright_page(page))
+    assert out["kind"] == "funcaptcha"
+    assert out["site_key"] == "PKEY-123"
+    # Solvers key on the page the operator is on, not the challenge iframe.
+    assert out["page_url"] == "https://www.figma.com/signup"
+    assert out["extra"]["in_iframe"] is True
+    assert out["extra"]["frame_url"] == "https://client-api.arkoselabs.com/challenge"
+    assert out["extra"]["surl"] == "https://client-api.arkoselabs.com"
+
+
+def test_captcha_in_the_main_frame_is_not_relabelled():
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    page = _FakePage([
+        _FakeFrame("https://example.test/login", {
+            "kind": "turnstile", "site_key": "0x4", "page_url": "https://example.test/login",
+            "extra": {}, "confidence": "high",
+        }),
+    ])
+    out = asyncio.run(detect_in_playwright_page(page))
+    assert out["kind"] == "turnstile"
+    assert out["page_url"] == "https://example.test/login"
+    assert "in_iframe" not in out["extra"]
+
+
+def test_a_detached_frame_does_not_blind_the_scan():
+    """Frames come and go while a challenge loads; one bad frame must not hide
+    a captcha sitting in the next one."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    page = _FakePage([
+        _FakeFrame("https://example.test/"),
+        _FakeFrame("https://gone.test/", boom=True),
+        _FakeFrame("https://hcaptcha.test/", {
+            "kind": "hcaptcha", "site_key": "abc", "page_url": "https://hcaptcha.test/",
+            "extra": {}, "confidence": "high",
+        }),
+    ])
+    out = asyncio.run(detect_in_playwright_page(page))
+    assert out["kind"] == "hcaptcha"
+    assert out["page_url"] == "https://example.test/"
+
+
+def test_clean_page_reports_no_captcha():
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    page = _FakePage([_FakeFrame("https://example.test/"), _FakeFrame("https://ads.test/")])
+    out = asyncio.run(detect_in_playwright_page(page))
+    assert out["kind"] is None
+
+
+def test_announced_but_unrendered_arkose_reads_as_pending():
+    """The enforcement script loads long before the challenge exists, and with a
+    good fingerprint the challenge may never render. Reporting that as a
+    solvable funcaptcha hands the solver a null site_key; reporting it as "no
+    captcha" tells the agent to carry on into a wall."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    announced = _FakePage([
+        _FakeFrame("https://www.figma.com/signup", {
+            "kind": None, "site_key": None, "pending": True,
+            "page_url": "https://www.figma.com/signup",
+            "extra": {"vendor": "arkose",
+                      "pending_reason": "Arkose script present, challenge not rendered yet"},
+            "confidence": "medium",
+        }),
+    ])
+    out = asyncio.run(detect_in_playwright_page(announced))
+    assert out["kind"] is None
+    assert out["pending"] is True
+    assert "arkose" in out["extra"]["vendor"]
+
+
+def test_detect_waits_for_a_challenge_to_render(monkeypatch):
+    """Poll while the widget is loading, and report the moment it appears."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha import detector as det
+
+    scans = {"n": 0}
+
+    async def fake_scan(page):
+        scans["n"] += 1
+        if scans["n"] < 3:
+            return {"kind": None, "site_key": None, "pending": True,
+                    "page_url": "u", "extra": {}, "confidence": "medium"}
+        return {"kind": "funcaptcha", "site_key": "PKEY", "pending": False,
+                "page_url": "u", "extra": {}, "confidence": "high"}
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(det, "_scan_once", fake_scan)
+    monkeypatch.setattr(det.asyncio, "sleep", no_sleep)
+
+    out = asyncio.run(det.detect_in_playwright_page(object(), wait_ms=10000))
+    assert out["kind"] == "funcaptcha"
+    assert out["site_key"] == "PKEY"
+    assert scans["n"] == 3
+
+
+def test_detect_stops_once_the_page_reads_clean_twice(monkeypatch):
+    """A challenge that resolves on its own must end the wait, not burn the
+    whole budget — but one clean read is not enough, the widget may be mid-swap."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha import detector as det
+
+    reads = [
+        {"kind": None, "pending": True, "site_key": None, "page_url": "u", "extra": {}, "confidence": "medium"},
+        {"kind": None, "pending": False, "site_key": None, "page_url": "u", "extra": {}, "confidence": "high"},
+        {"kind": None, "pending": False, "site_key": None, "page_url": "u", "extra": {}, "confidence": "high"},
+    ]
+    seen = {"n": 0}
+
+    async def fake_scan(page):
+        out = reads[min(seen["n"], len(reads) - 1)]
+        seen["n"] += 1
+        return dict(out)
+
+    async def no_sleep(_seconds):
+        return None
+
+    monkeypatch.setattr(det, "_scan_once", fake_scan)
+    monkeypatch.setattr(det.asyncio, "sleep", no_sleep)
+
+    out = asyncio.run(det.detect_in_playwright_page(object(), wait_ms=30000))
+    assert out["kind"] is None
+    assert out["pending"] is False
+    assert seen["n"] == 3, "should stop on the second consecutive clean read"
+    assert out["waited_ms"] < 30000

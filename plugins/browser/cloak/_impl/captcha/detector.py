@@ -22,7 +22,11 @@ Returns a dict::
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 from typing import Any, Optional
+
+logger = logging.getLogger(__name__)
 
 # Pure JS — single expression returning a plain object. Designed to be
 # fed straight into Playwright's ``page.evaluate(_DETECT_JS)``.
@@ -106,8 +110,20 @@ _DETECT_JS = r"""
   const fScript = $('script[src*="arkose"], script[src*="funcaptcha"], script[src*="arkoselabs"]');
   const fIframe = $('iframe[src*="arkose"], iframe[src*="funcaptcha"]');
   if (fDiv || fScript || fIframe) {
+    const pkey = (fDiv && (fDiv.getAttribute("data-pkey") || fDiv.getAttribute("data-public-key"))) || null;
+    // The enforcement script loads well before the challenge exists, and with a
+    // convincing fingerprint the challenge may never render. Script-only, with
+    // no iframe and no public key, means "announced, not rendered" — not a
+    // solvable captcha. Calling it solvable sends the solver a null site_key.
+    if (!fIframe && !pkey) {
+      out.pending = true;
+      out.confidence = "medium";
+      out.extra.vendor = "arkose";
+      out.extra.pending_reason = "Arkose script present, challenge not rendered yet";
+      return out;
+    }
     out.kind = "funcaptcha";
-    out.site_key = (fDiv && (fDiv.getAttribute("data-pkey") || fDiv.getAttribute("data-public-key"))) || null;
+    out.site_key = pkey;
     if (fIframe) {
       try {
         const u = new URL(fIframe.src, location.href);
@@ -213,26 +229,129 @@ _DETECT_JS = r"""
     return out;
   }
 
+  // --- Challenge announced but not yet rendered ---
+  // A verification step often paints "checking your browser" / "captcha
+  // loading" seconds before the widget exists — and with a good fingerprint it
+  // may resolve on its own and never render one at all. Reporting a plain
+  // "no captcha" here is what made the two outcomes indistinguishable, so say
+  // "pending" and let the caller wait it out.
+  const vendorScript = $('script[src*="arkoselabs"], script[src*="funcaptcha"], script[src*="hcaptcha"], script[src*="recaptcha"], script[src*="challenges.cloudflare.com"]');
+  const emptyHolder = $('#arkose, [data-arkose], .arkose-iframe-container, [data-pkey], .funcaptcha, .h-captcha, .g-recaptcha, .cf-turnstile');
+  const text = (document.body && document.body.innerText || "").toLowerCase().slice(0, 4000);
+  const phrases = ["captcha loading", "loading captcha", "checking your browser",
+                   "verifying you are human", "verify you are human", "just a moment",
+                   "please wait while we verify", "browser verification"];
+  const phrase = phrases.find(p => text.includes(p)) || null;
+  if (phrase || vendorScript || emptyHolder) {
+    out.pending = true;
+    out.confidence = "medium";
+    out.extra.pending_reason = phrase
+      ? ("page says: " + phrase)
+      : (emptyHolder ? "challenge container present but empty" : "challenge script loaded, widget not rendered");
+    return out;
+  }
+
   return out; // kind: null
 })();
 """
 
 
-async def detect_in_playwright_page(page: Any) -> dict:
+def _empty_result() -> dict:
+    return {"kind": None, "site_key": None, "page_url": "", "extra": {}, "confidence": "high"}
+
+
+def _normalised(result: Any) -> Optional[dict]:
+    if not isinstance(result, dict):
+        return None
+    result.setdefault("kind", None)
+    result.setdefault("site_key", None)
+    result.setdefault("page_url", "")
+    if not isinstance(result.get("extra"), dict):
+        result["extra"] = {}
+    result.setdefault("confidence", "high")
+    result["pending"] = bool(result.get("pending"))
+    return result
+
+
+async def _scan_once(page: Any) -> dict:
+    """One frame-aware pass. See :func:`detect_in_playwright_page`."""
     """Run the detector in a Playwright page; returns the dict described above.
+
+    Every frame is scanned, not just the main document. Arkose/FunCaptcha,
+    hCaptcha and reCAPTCHA all render inside an iframe, and the top document
+    cannot even read a cross-origin one from JS — so a main-frame-only scan
+    reported "no captcha" on exactly the pages that had one. Playwright can
+    evaluate inside those frames, so ask each of them.
 
     ``page`` may be either an async Playwright Page or anything with a
     compatible ``evaluate`` coroutine.
     """
-    result = await page.evaluate(_DETECT_JS)
-    if not isinstance(result, dict):
-        return {"kind": None, "site_key": None, "page_url": "", "extra": {}, "confidence": "high"}
-    # Normalise.
-    result.setdefault("kind", None)
-    result.setdefault("site_key", None)
-    result.setdefault("page_url", "")
-    result.setdefault("extra", {})
-    result.setdefault("confidence", "high")
+    frames = list(getattr(page, "frames", None) or [])
+    if not frames:
+        return _normalised(await page.evaluate(_DETECT_JS)) or _empty_result()
+
+    # frames[0] is the main frame; scanning in order reports a top-level
+    # captcha as top-level rather than attributing it to a subframe.
+    main_url = str(getattr(frames[0], "url", "") or "")
+    fallback: Optional[dict] = None
+    for index, frame in enumerate(frames):
+        try:
+            result = _normalised(await frame.evaluate(_DETECT_JS))
+        except Exception as exc:  # noqa: BLE001
+            # A frame can detach mid-scan, or refuse evaluation while it
+            # navigates. One bad frame must not blind the whole scan.
+            logger.debug("captcha scan skipped a frame: %s", exc)
+            continue
+        if result is None:
+            continue
+        if result.get("kind"):
+            if index:
+                # Solvers key on the page the operator is on, not on the
+                # challenge iframe's own URL.
+                result["extra"]["frame_url"] = result.get("page_url") or ""
+                result["extra"]["in_iframe"] = True
+                result["page_url"] = main_url or result.get("page_url") or ""
+            return result
+        if fallback is None:
+            fallback = result
+    return fallback or _empty_result()
+
+
+async def detect_in_playwright_page(page: Any, wait_ms: int = 0) -> dict:
+    """Classify any captcha on the page, optionally waiting for it to settle.
+
+    A verification step commonly announces itself ("captcha loading", "checking
+    your browser") seconds before the widget appears — and with a convincing
+    fingerprint it may clear on its own and never show one. A single snapshot
+    cannot tell "no captcha" from "not yet", which leaves the caller guessing at
+    exactly the moment it matters.
+
+    With ``wait_ms`` the scan keeps polling until it finds a real captcha, or
+    the page reports clean twice in a row, or the budget runs out. The result
+    carries ``pending`` and ``waited_ms`` so a timeout is visible as a timeout
+    rather than as an all-clear.
+    """
+    deadline_ms = max(0, int(wait_ms or 0))
+    result = await _scan_once(page)
+    if result.get("kind") or deadline_ms <= 0:
+        result.setdefault("waited_ms", 0)
+        return result
+
+    step = 0.5
+    waited = 0.0
+    clean_streak = 1 if not result.get("pending") else 0
+    while waited * 1000 < deadline_ms:
+        await asyncio.sleep(step)
+        waited += step
+        result = await _scan_once(page)
+        if result.get("kind"):
+            break
+        # Two consecutive clean reads: the challenge resolved itself, or there
+        # never was one. One is not enough — the widget may be mid-swap.
+        clean_streak = 0 if result.get("pending") else clean_streak + 1
+        if clean_streak >= 2:
+            break
+    result["waited_ms"] = int(waited * 1000)
     return result
 
 

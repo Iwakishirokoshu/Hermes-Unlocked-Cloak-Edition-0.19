@@ -240,9 +240,23 @@ SCHEMA_SOLVE_CAPTCHA = {
 
 SCHEMA_DETECT_CAPTCHA = {
     "type": "object",
-    "properties": {},
-    "description": "Detect any captcha currently rendered on the active CloakBrowser tab. "
-                   "Returns {kind, site_key, page_url, extra, confidence}. kind=null = no captcha.",
+    "properties": {
+        "wait_ms": {
+            "type": "integer",
+            "default": 0,
+            "description": (
+                "Wait up to this long (max 60000) for a challenge to settle. Use it right "
+                "after submitting a form: a verification step often says 'captcha loading' "
+                "seconds before the widget exists, and with a good fingerprint it may clear "
+                "on its own and never render one. Returns as soon as a real captcha appears "
+                "or the page reads clean twice."
+            ),
+        },
+    },
+    "description": "Detect any captcha on the active CloakBrowser tab, scanning every frame. "
+                   "Returns {kind, site_key, page_url, extra, confidence, pending, waited_ms}. "
+                   "kind=null with pending=false means no captcha; pending=true means a "
+                   "challenge was announced but has not rendered — wait, do not proceed.",
 }
 
 
@@ -874,8 +888,15 @@ async def cloak_detect_captcha(args: dict | None = None, **kw: Any) -> Dict[str,
     "extra": {...}, "confidence": "high|medium|low"}`` or an error dict
     if no active profile is bound.
 
-    ``kind == null`` means no captcha detected — proceed normally.
+    ``kind == null`` with ``pending == false`` means no captcha — proceed.
+    ``pending == true`` means a challenge was announced but has not rendered
+    yet; call again with ``wait_ms`` rather than treating it as all-clear.
     """
+    args = args or {}
+    try:
+        wait_ms = max(0, min(60000, int(args.get("wait_ms") or 0)))
+    except (TypeError, ValueError):
+        wait_ms = 0
     cdp_url = profile_state.cdp_url_for_task(kw.get("task_id"))
     if not cdp_url:
         return {
@@ -884,7 +905,7 @@ async def cloak_detect_captcha(args: dict | None = None, **kw: Any) -> Dict[str,
     preset = os.environ.get("CLOAK_HUMAN_PRESET", "default")
     try:
         async with get_pool().hold(cdp_url, preset=preset) as client:
-            return await detect_in_playwright_page(client.page)
+            return await detect_in_playwright_page(client.page, wait_ms=wait_ms)
     except Exception as exc:  # noqa: BLE001
         safe_error = redact_cdp_url(str(exc))
         logger.error("cloak_detect_captcha failed: %s", safe_error)
