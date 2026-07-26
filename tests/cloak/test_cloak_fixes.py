@@ -2054,3 +2054,89 @@ def test_captcha_autodetect_can_be_turned_off(monkeypatch):
     import plugins.browser.cloak._impl.captcha as captcha_pkg
     monkeypatch.setattr(captcha_pkg, "detect_in_playwright_page", explode)
     assert asyncio.run(tb._scan_for_captcha(object())) is None
+
+
+class _FakeContext:
+    def __init__(self, pages):
+        self.pages = pages
+
+
+class _FakeTab:
+    """A tab: has frames, and knows which context it belongs to."""
+
+    def __init__(self, frames, context=None):
+        self.frames = frames
+        self.context = context
+
+    async def evaluate(self, js):
+        raise AssertionError("tab scan must go through frames")
+
+
+def test_captcha_scan_covers_every_tab():
+    """Registration opens in a second tab. The pooled client is pinned to the
+    context's first tab, so the detector was reading the page the operator had
+    already left and answering "no captcha" while the challenge sat one tab
+    over — which is what made the agent give up and kill the profile."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    first = _FakeTab([_FakeFrame("https://www.figma.com/education/")])
+    second = _FakeTab([
+        _FakeFrame("https://www.figma.com/signup"),
+        _FakeFrame("https://client-api.arkoselabs.com/challenge", {
+            "kind": "funcaptcha", "site_key": "PKEY-XYZ",
+            "page_url": "https://client-api.arkoselabs.com/challenge",
+            "extra": {}, "confidence": "high",
+        }),
+    ])
+    context = _FakeContext([first, second])
+    first.context = context
+    second.context = context
+
+    out = asyncio.run(detect_in_playwright_page(first))
+    assert out["kind"] == "funcaptcha"
+    assert out["site_key"] == "PKEY-XYZ"
+    assert out["extra"]["other_tab"] is True
+    assert out["extra"]["tab_index"] == 1
+    # Found in an iframe of that tab, so the solver still gets the tab's own URL.
+    assert out["page_url"] == "https://www.figma.com/signup"
+
+
+def test_a_captcha_on_the_current_tab_is_not_marked_as_elsewhere():
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    here = _FakeTab([_FakeFrame("https://x.test/", {
+        "kind": "hcaptcha", "site_key": "k", "page_url": "https://x.test/",
+        "extra": {}, "confidence": "high",
+    })])
+    other = _FakeTab([_FakeFrame("https://ads.test/")])
+    context = _FakeContext([here, other])
+    here.context = context
+    other.context = context
+
+    out = asyncio.run(detect_in_playwright_page(here))
+    assert out["kind"] == "hcaptcha"
+    assert "other_tab" not in out["extra"]
+
+
+def test_a_pending_challenge_in_another_tab_is_reported_too():
+    """"Captcha is loading" in the signup tab must not read as an all-clear
+    just because the tab we hold is quiet."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    quiet = _FakeTab([_FakeFrame("https://www.figma.com/education/")])
+    loading = _FakeTab([_FakeFrame("https://www.figma.com/signup", {
+        "kind": None, "site_key": None, "pending": True,
+        "page_url": "https://www.figma.com/signup",
+        "extra": {"pending_reason": "page says: captcha loading"}, "confidence": "medium",
+    })])
+    context = _FakeContext([quiet, loading])
+    quiet.context = context
+    loading.context = context
+
+    out = asyncio.run(detect_in_playwright_page(quiet))
+    assert out["kind"] is None
+    assert out["pending"] is True
+    assert out["extra"]["other_tab"] is True

@@ -273,18 +273,50 @@ def _normalised(result: Any) -> Optional[dict]:
     return result
 
 
+def _pages_to_scan(page: Any) -> list:
+    """Every tab of the profile, starting with the one we were handed.
+
+    The pooled client is pinned to the context's first tab, so a flow that
+    opens the challenge in a second tab left the detector reading the page the
+    operator had already left — answering "no captcha" while the screenshot
+    plainly showed one, which is worse than not answering at all.
+    """
+    context = getattr(page, "context", None)
+    pages = list(getattr(context, "pages", None) or [])
+    if not pages:
+        return [page]
+    # Keep the handed-in page first, so a captcha there reports as tab 0.
+    return [page] + [other for other in pages if other is not page]
+
+
 async def _scan_once(page: Any) -> dict:
-    """One frame-aware pass. See :func:`detect_in_playwright_page`."""
-    """Run the detector in a Playwright page; returns the dict described above.
+    """One pass over every tab of the profile, and every frame of each tab."""
+    fallback: Optional[dict] = None
+    for tab_index, tab in enumerate(_pages_to_scan(page)):
+        try:
+            result = await _scan_page(tab)
+        except Exception as exc:  # noqa: BLE001
+            # A tab can close mid-scan; that must not blind the rest.
+            logger.debug("captcha scan skipped a tab: %s", exc)
+            continue
+        if result.get("kind") or result.get("pending"):
+            if tab_index:
+                result["extra"]["tab_index"] = tab_index
+                result["extra"]["other_tab"] = True
+            return result
+        if fallback is None:
+            fallback = result
+    return fallback or _empty_result()
+
+
+async def _scan_page(page: Any) -> dict:
+    """One frame-aware pass over a single tab.
 
     Every frame is scanned, not just the main document. Arkose/FunCaptcha,
     hCaptcha and reCAPTCHA all render inside an iframe, and the top document
     cannot even read a cross-origin one from JS — so a main-frame-only scan
     reported "no captcha" on exactly the pages that had one. Playwright can
     evaluate inside those frames, so ask each of them.
-
-    ``page`` may be either an async Playwright Page or anything with a
-    compatible ``evaluate`` coroutine.
     """
     frames = list(getattr(page, "frames", None) or [])
     if not frames:
