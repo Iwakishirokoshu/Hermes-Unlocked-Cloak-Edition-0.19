@@ -2140,3 +2140,46 @@ def test_a_pending_challenge_in_another_tab_is_reported_too():
     assert out["kind"] is None
     assert out["pending"] is True
     assert out["extra"]["other_tab"] is True
+
+
+def test_detector_js_matches_the_real_figma_markup():
+    """Taken verbatim from a live transcript: the banner reads "Captcha is
+    loading..." and the Arkose frame carries a title, not a src. The literal
+    phrase list missed the first and the src-only selector missed the second,
+    so the tool answered "no captcha" on the page that had one."""
+    from plugins.browser.cloak._impl.captcha.detector import _DETECT_JS
+
+    # The banner is matched by shape, not by an exact substring.
+    assert r"/captcha\s+(?:is\s+)?loading/" in _DETECT_JS
+    # ...and headings count, because that page is little else.
+    assert 'querySelectorAll("h1, h2, [role=heading]")' in _DETECT_JS
+    # A frame identified by title/name/id, not only by src.
+    assert 'iframe[title*="arkose" i]' in _DETECT_JS
+    assert 'iframe[name*="arkose" i]' in _DETECT_JS
+    # A frame with no usable src and no public key is pending, not solvable.
+    assert "the public key is not exposed yet" in _DETECT_JS
+    assert "hasVendorSrc" in _DETECT_JS
+
+
+def test_a_pending_banner_in_a_subframe_is_not_lost():
+    """Figma's signup form and its "Captcha is loading..." banner live in a
+    login iframe. Returning early only on a resolved kind let the main frame's
+    clean read win, so the tool said "no captcha" about a page that had one."""
+    import asyncio
+    from plugins.browser.cloak._impl.captcha.detector import detect_in_playwright_page
+
+    page = _FakePage([
+        _FakeFrame("https://www.figma.com/education/"),
+        _FakeFrame("https://www.figma.com/login_iframe?form_state=sign_up", {
+            "kind": None, "site_key": None, "pending": True,
+            "page_url": "https://www.figma.com/login_iframe?form_state=sign_up",
+            "extra": {"vendor": "arkose",
+                      "pending_reason": "Arkose frame present but the public key is not exposed yet"},
+            "confidence": "medium",
+        }),
+    ])
+    out = asyncio.run(detect_in_playwright_page(page))
+    assert out["kind"] is None
+    assert out["pending"] is True
+    assert out["extra"]["in_iframe"] is True
+    assert out["page_url"] == "https://www.figma.com/education/"

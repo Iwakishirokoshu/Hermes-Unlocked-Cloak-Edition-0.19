@@ -108,25 +108,30 @@ _DETECT_JS = r"""
   // --- FunCaptcha / Arkose ---
   const fDiv = $('#arkose, [data-arkose], .arkose-iframe-container, .funcaptcha, [data-pkey]');
   const fScript = $('script[src*="arkose"], script[src*="funcaptcha"], script[src*="arkoselabs"]');
-  const fIframe = $('iframe[src*="arkose"], iframe[src*="funcaptcha"]');
+  const fIframe = $('iframe[src*="arkose"], iframe[src*="funcaptcha"], iframe[title*="arkose" i], iframe[name*="arkose" i], iframe[id*="arkose" i], iframe[title*="funcaptcha" i]');
   if (fDiv || fScript || fIframe) {
     const pkey = (fDiv && (fDiv.getAttribute("data-pkey") || fDiv.getAttribute("data-public-key"))) || null;
-    // The enforcement script loads well before the challenge exists, and with a
-    // convincing fingerprint the challenge may never render. Script-only, with
-    // no iframe and no public key, means "announced, not rendered" — not a
-    // solvable captcha. Calling it solvable sends the solver a null site_key.
-    if (!fIframe && !pkey) {
+    const frameSrc = (fIframe && fIframe.getAttribute("src")) || "";
+    const hasVendorSrc = /arkose|funcaptcha/i.test(frameSrc);
+    // A solver needs the public key. Without one — enforcement script only, or
+    // an Arkose frame that exists but has not been populated yet, which is what
+    // "Captcha is loading..." looks like in the DOM — the challenge is announced
+    // rather than solvable. Reporting it as solvable hands the solver a null
+    // site_key; reporting it as absent tells the agent to walk into a wall.
+    if (!pkey && !hasVendorSrc) {
       out.pending = true;
       out.confidence = "medium";
       out.extra.vendor = "arkose";
-      out.extra.pending_reason = "Arkose script present, challenge not rendered yet";
+      out.extra.pending_reason = fIframe
+        ? "Arkose frame present but the public key is not exposed yet"
+        : "Arkose script present, challenge not rendered yet";
       return out;
     }
     out.kind = "funcaptcha";
     out.site_key = pkey;
-    if (fIframe) {
+    if (hasVendorSrc) {
       try {
-        const u = new URL(fIframe.src, location.href);
+        const u = new URL(frameSrc, location.href);
         const surl = u.origin + u.pathname.split("/").slice(0, -1).join("/");
         out.extra.surl = surl;
       } catch (e) {}
@@ -237,11 +242,22 @@ _DETECT_JS = r"""
   // "pending" and let the caller wait it out.
   const vendorScript = $('script[src*="arkoselabs"], script[src*="funcaptcha"], script[src*="hcaptcha"], script[src*="recaptcha"], script[src*="challenges.cloudflare.com"]');
   const emptyHolder = $('#arkose, [data-arkose], .arkose-iframe-container, [data-pkey], .funcaptcha, .h-captcha, .g-recaptcha, .cf-turnstile');
-  const text = (document.body && document.body.innerText || "").toLowerCase().slice(0, 4000);
-  const phrases = ["captcha loading", "loading captcha", "checking your browser",
-                   "verifying you are human", "verify you are human", "just a moment",
-                   "please wait while we verify", "browser verification"];
-  const phrase = phrases.find(p => text.includes(p)) || null;
+  const headings = Array.prototype.map.call(
+    document.querySelectorAll("h1, h2, [role=heading]"), h => h.textContent || "").join(" ");
+  const text = ((document.body && document.body.innerText || "") + " " + headings)
+    .toLowerCase().slice(0, 4000);
+  const patterns = [
+    /captcha\s+(?:is\s+)?loading/,          // "Captcha is loading..."
+    /loading\s+(?:the\s+)?captcha/,
+    /checking\s+your\s+browser/,
+    /verif(?:ying|y)\s+(?:that\s+)?you\s+are\s+human/,
+    /just\s+a\s+moment/,
+    /please\s+wait\s+while\s+we\s+verify/,
+    /browser\s+verification/,
+    /one\s+more\s+step/,
+  ];
+  const hit = patterns.map(re => text.match(re)).find(Boolean) || null;
+  const phrase = hit ? hit[0] : null;
   if (phrase || vendorScript || emptyHolder) {
     out.pending = true;
     out.confidence = "medium";
@@ -336,7 +352,11 @@ async def _scan_page(page: Any) -> dict:
             continue
         if result is None:
             continue
-        if result.get("kind"):
+        # "Still loading" counts as a hit too. Returning only on a resolved
+        # kind meant a pending banner in a subframe lost to the main frame's
+        # clean read — which is exactly the Figma signup, where the banner and
+        # the Arkose frame live inside a login iframe.
+        if result.get("kind") or result.get("pending"):
             if index:
                 # Solvers key on the page the operator is on, not on the
                 # challenge iframe's own URL.
