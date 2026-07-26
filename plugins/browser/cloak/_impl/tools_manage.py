@@ -160,11 +160,10 @@ def _normalize_profile_tags(raw_tags: Any) -> List[Dict[str, str]]:
 SCHEMA_LAUNCH = {
     "type": "object",
     "properties": {
-        "profile": {"type": "string", "description": "Profile id (UUID) OR name to launch."},
+        "profile": {"type": "string", "description": "Profile id (UUID) or name to launch. Names come from cloak_list_profiles, so the operator can refer to a profile by name."},
         "allow_profile_switch": {
             "type": "boolean",
-            "default": False,
-            "description": "Allow this task to switch away from its remembered profile.",
+            "description": "Allow this task to switch away from its remembered profile. Set true when the operator names a different profile. Omit to follow the CLOAK_ALLOW_PROFILE_SWITCH setting.",
         },
     },
     "required": ["profile"],
@@ -179,7 +178,10 @@ SCHEMA_SET_ACTIVE = {
         "human_preset": {"type": "string", "enum": ["default", "careful"], "default": "default"},
         "proxy": {"type": "string", "default": ""},
         "use_pool": {"type": "boolean", "description": "Take the next proxy from the configured proxy pool when no explicit proxy is given.", "default": False},
-        "allow_profile_switch": {"type": "boolean", "default": False},
+        "allow_profile_switch": {
+            "type": "boolean",
+            "description": "Allow this task to switch away from its remembered profile. Omit to follow the CLOAK_ALLOW_PROFILE_SWITCH setting.",
+        },
     },
     "required": ["profile"],
 }
@@ -343,8 +345,33 @@ async def cloak_launch(args: dict, **kw: Any) -> Dict[str, Any]:
     return await _launch_profile(
         profile,
         task_id=kw.get("task_id"),
-        allow_profile_switch=bool(args.get("allow_profile_switch", False)),
+        allow_profile_switch=_profile_switch_allowed(args.get("allow_profile_switch")),
     )
+
+
+async def _profile_display_name(
+    mgr: ManagerClient,
+    requested: str,
+    profile_id: str,
+    binding: Optional[Dict[str, Any]],
+) -> str:
+    """Name of the profile actually being launched.
+
+    Reporting ``binding["profile_name"]`` meant a launch that switched profiles
+    answered with the name of the *previous* one, so "back to wf-alpha" replied
+    "wf-beta" and the model could not tell whether the switch had happened.
+    """
+    value = str(requested or "").strip()
+    if value and not profile_state.is_uuid(value):
+        return value  # resolved by name, so that is the name
+    try:
+        record = await mgr.get_profile(profile_id)
+        name = str((record or {}).get("name") or "").strip()
+        if name:
+            return name
+    except Exception:  # noqa: BLE001
+        pass
+    return str((binding or {}).get("profile_name") or value)
 
 
 async def _launch_profile(
@@ -357,6 +384,7 @@ async def _launch_profile(
     async with ManagerClient() as mgr:
         try:
             profile_id = await _resolve_profile_id(mgr, profile, task_id=task_id)
+            launched_name = await _profile_display_name(mgr, profile, profile_id, binding_before)
             guard = _profile_switch_guard(
                 binding_before,
                 requested_profile_id=profile_id,
@@ -431,7 +459,7 @@ async def _launch_profile(
 
         return {
             "profile_id": resp.get("profile_id", profile_id),
-            "profile_name": str((binding_before or {}).get("profile_name") or profile),
+            "profile_name": launched_name,
             "status": resp.get("status"),
             "status_after": status_after.get("status"),
             "cdp_url": redact_cdp_url(cdp_abs),
@@ -453,7 +481,7 @@ async def cloak_set_active(args: dict, **kw: Any) -> Dict[str, Any]:
         proxy=args.get("proxy", ""),
         use_pool=args.get("use_pool"),
         task_id=kw.get("task_id"),
-        allow_profile_switch=bool(args.get("allow_profile_switch", False)),
+        allow_profile_switch=_profile_switch_allowed(args.get("allow_profile_switch")),
     )
 
 
@@ -652,7 +680,12 @@ async def cloak_proxy_pool(args: dict | None = None, **kw: Any) -> Dict[str, Any
         pool = pf.add_proxies(ok)
         return {
             "added": len(ok),
-            "invalid": [pf.mask_proxy(item) for item in bad],
+            "invalid": [pf.describe_invalid(item) for item in bad],
+            "invalid_hint": (
+                "Lines above could not be parsed. Accepted: host:port, "
+                "host:port:user:pass, user:pass@host:port, scheme://... "
+                "(socks4 is rejected — CloakBrowser cannot speak it)."
+            ) if bad else "",
             "count": len(pool.get("proxies") or []),
         }
 
@@ -753,7 +786,10 @@ async def cloak_list_profiles(args: dict | None = None, **kw: Any) -> Dict[str, 
             profiles = await mgr.list_profiles()
         except ManagerError as exc:
             return {"error": redact_cdp_url(exc), "status_code": exc.status_code}
-    # Trim to a compact form the LLM can scan.
+    # Trim to a compact form the LLM can scan. The proxy is masked — the model
+    # needs to know *which* profile carries *which* egress, never the password.
+    from ..proxy_format import mask_proxy
+
     return {
         "profiles": [
             {
@@ -762,6 +798,9 @@ async def cloak_list_profiles(args: dict | None = None, **kw: Any) -> Dict[str, 
                 "status": p.get("status"),
                 "humanize": p.get("humanize"),
                 "tags": p.get("tags", []),
+                "has_proxy": bool(p.get("proxy")),
+                "proxy": mask_proxy(p.get("proxy")) if p.get("proxy") else "",
+                "created_at": p.get("created_at"),
             }
             for p in profiles
         ]
@@ -858,6 +897,21 @@ async def _resolve_profile_id(
     if existing is None:
         raise ManagerError(404, value, "profile not found by name")
     return existing["id"]
+
+
+def _profile_switch_allowed(explicit: Optional[bool]) -> bool:
+    """Whether this task may move to a profile other than the one it remembers.
+
+    An explicit argument always wins. Otherwise ``CLOAK_ALLOW_PROFILE_SWITCH``
+    decides: leave it off and a task stays pinned to one profile (protects a
+    long registration from being hijacked mid-flow); turn it on and the operator
+    can say "switch to profile X" and have it just happen.
+    """
+    if explicit is not None:
+        return bool(explicit)
+    from ..proxy_format import setting
+
+    return setting("CLOAK_ALLOW_PROFILE_SWITCH").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _binding_points_at(binding: Optional[Dict[str, Any]], profile_id: str) -> bool:

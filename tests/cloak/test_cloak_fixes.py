@@ -1488,3 +1488,100 @@ def test_launch_drops_a_binding_whose_profile_is_gone():
     assert not _binding_points_at({"profile_id": "p2"}, "p1")
     assert not _binding_points_at(None, "p1")
     assert not _binding_points_at({}, "p1")
+
+
+def test_profile_switch_default_follows_the_setting(tmp_path, monkeypatch):
+    """The operator should be able to say "use profile X" and have it happen,
+    without the model having to remember an escape-hatch flag every time."""
+    from plugins.browser.cloak._impl.tools_manage import _profile_switch_allowed
+
+    env_file = tmp_path / "switch" / "manager.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CLOAK_MANAGER_ENV", str(env_file))
+
+    # Nothing configured: stay pinned to the remembered profile.
+    env_file.write_text("", encoding="utf-8")
+    assert _profile_switch_allowed(None) is False
+
+    # Turned on in manager.env — no gateway restart needed.
+    env_file.write_text("CLOAK_ALLOW_PROFILE_SWITCH=1\n", encoding="utf-8")
+    assert _profile_switch_allowed(None) is True
+
+    # An explicit argument always wins over the setting, both ways.
+    assert _profile_switch_allowed(False) is False
+    env_file.write_text("CLOAK_ALLOW_PROFILE_SWITCH=0\n# off\n", encoding="utf-8")
+    assert _profile_switch_allowed(True) is True
+
+
+def test_list_profiles_exposes_masked_proxy(monkeypatch):
+    """Picking a profile by name only works if the listing says enough about it —
+    including which egress it carries, with the password never leaving Cloak."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    class Mgr:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return None
+
+        async def list_profiles(self):
+            return [
+                {"id": "p1", "name": "shopper-de", "status": "running",
+                 "proxy": "socks5://user:hunter2@de.example:1080", "created_at": "2026-07-27T00:00:00Z"},
+                {"id": "p2", "name": "scratch", "status": "stopped", "proxy": None},
+            ]
+
+    monkeypatch.setattr(tm, "ManagerClient", Mgr)
+    out = asyncio.run(tm.cloak_list_profiles({}))
+    first, second = out["profiles"]
+
+    assert first["name"] == "shopper-de" and first["has_proxy"] is True
+    assert first["proxy"] == "socks5://de.example:1080"
+    assert "hunter2" not in str(out) and "user" not in first["proxy"]
+    assert second["has_proxy"] is False and second["proxy"] == ""
+
+
+def test_invalid_pasted_proxy_lines_are_identifiable_but_redacted():
+    """Pasting twenty proxies with one typo used to report '<invalid proxy>' —
+    true, redacted, and useless for finding the bad line."""
+    from plugins.browser.cloak.proxy_format import describe_invalid
+
+    assert describe_invalid("garbage-line") == "garbage-line"
+    assert describe_invalid("socks4://1.2.3.4:1080") == "socks4://1.2.3.4:1080"
+    # Credentials never survive the preview.
+    out = describe_invalid("alice:hunter2@nope")
+    assert out == "<creds>@nope"
+    assert "hunter2" not in out
+    assert describe_invalid("u:p@" + "x" * 80).endswith("…")
+    assert describe_invalid("") == ""
+
+
+def test_launch_reports_the_profile_it_actually_launched(monkeypatch):
+    """A launch that switched profiles answered with the *previous* profile's
+    name, so the model could not tell whether the switch had taken effect."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    class Mgr:
+        async def get_profile(self, profile_id):
+            return {"id": profile_id, "name": "resolved-by-id"}
+
+    binding = {"profile_name": "previously-bound", "profile_id": "old"}
+
+    # Asked by name → that name is authoritative, no extra lookup needed.
+    assert asyncio.run(
+        tm._profile_display_name(Mgr(), "wf-alpha", "uuid-1", binding)
+    ) == "wf-alpha"
+
+    # Asked by UUID → look the real name up rather than echoing the binding.
+    uuid = "3f5d019d-1111-2222-3333-444455556666"
+    assert asyncio.run(
+        tm._profile_display_name(Mgr(), uuid, uuid, binding)
+    ) == "resolved-by-id"
+
+    # Nothing requested (resolved from the binding) → the binding name is right.
+    assert asyncio.run(
+        tm._profile_display_name(Mgr(), "", "old", binding)
+    ) == "resolved-by-id"

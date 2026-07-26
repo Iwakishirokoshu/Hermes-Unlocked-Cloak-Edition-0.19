@@ -220,6 +220,26 @@ def parse_lines(text: str, default_scheme: str = "http") -> Tuple[List[str], Lis
     return ok, bad
 
 
+def describe_invalid(line: str, limit: int = 48) -> str:
+    """Redacted preview of a line that failed to parse.
+
+    ``mask_proxy`` collapses anything unparseable to ``<invalid proxy>``, which
+    is useless when someone pastes twenty proxies and one is malformed — they
+    cannot tell which. Show the line with any credential part removed so the
+    operator can spot the typo without the password reaching a log or the model.
+    """
+    text = str(line or "").strip()
+    if not text:
+        return ""
+    # Drop everything up to and including the last '@' — that is where
+    # user:pass lives in every format we accept.
+    if "@" in text:
+        text = "<creds>@" + text.rsplit("@", 1)[1]
+    if len(text) > limit:
+        text = text[:limit] + "…"
+    return text
+
+
 def mask_proxy(entry: Any) -> str:
     """Hide the password for display: ``http://user:****@host:port``."""
     try:
