@@ -57,6 +57,41 @@ def _wrap_sync_tool(fn: Callable[..., Any]) -> Callable[[dict, Any], str]:
     return handler
 
 
+def as_function_schema(schema: Any, description: str = "") -> dict:
+    """Wrap a bare JSON-Schema into the OpenAI *function* object Hermes expects.
+
+    ``tools.registry`` publishes a tool as ``{"type": "function", "function":
+    {**entry.schema, "name": entry.name}}``, so ``entry.schema`` must already be
+    the function object — the argument schema lives under its ``parameters``
+    key. Handing the registry a bare ``{"type": "object", "properties": {...}}``
+    produces a function object with no ``parameters`` at all, and
+    ``tools.schema_sanitizer`` then substitutes ``{"type": "object",
+    "properties": {}}``. The model receives a tool that takes no arguments and
+    can only ever call it with ``{}``.
+    """
+    if isinstance(schema, dict) and isinstance(schema.get("parameters"), dict):
+        return schema  # already function-shaped — leave it alone
+    params = schema if isinstance(schema, dict) else {}
+    if params.get("type") != "object" or not isinstance(params.get("properties"), dict):
+        params = {
+            "type": "object",
+            "properties": params.get("properties") if isinstance(params.get("properties"), dict) else {},
+        }
+    out: dict = {"parameters": params}
+    if description:
+        out["description"] = description
+    return out
+
+
+def register_tool(ctx: Any, *, schema: Any = None, description: str = "", **kwargs: Any) -> None:
+    """``ctx.register_tool`` with the schema normalized to function shape."""
+    ctx.register_tool(
+        schema=as_function_schema(schema, description),
+        description=description,
+        **kwargs,
+    )
+
+
 # ============================================================================
 # Plugin registration
 # ============================================================================
@@ -227,7 +262,7 @@ _patch_native_browser_navigate = _patch_native_browser_tools
 
 def _register_manage_tools(ctx: Any) -> None:
     """Toolset 'cloak' — 6 management tools."""
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_create_profile",
         toolset="cloak",
         schema=tools_manage.SCHEMA_CREATE,
@@ -236,7 +271,7 @@ def _register_manage_tools(ctx: Any) -> None:
         description="Create a stealth browser profile on CloakBrowser-Manager.",
         emoji="🪪",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_launch",
         toolset="cloak",
         schema=tools_manage.SCHEMA_LAUNCH,
@@ -248,7 +283,7 @@ def _register_manage_tools(ctx: Any) -> None:
         ),
         emoji="🚀",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_set_active",
         toolset="cloak",
         schema=tools_manage.SCHEMA_SET_ACTIVE,
@@ -261,7 +296,7 @@ def _register_manage_tools(ctx: Any) -> None:
         ),
         emoji="🎯",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_stop",
         toolset="cloak",
         schema=tools_manage.SCHEMA_STOP,
@@ -270,7 +305,7 @@ def _register_manage_tools(ctx: Any) -> None:
         description="Stop a profile and drop its cached Playwright client.",
         emoji="🛑",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_list_profiles",
         toolset="cloak",
         schema=tools_manage.SCHEMA_LIST,
@@ -279,7 +314,7 @@ def _register_manage_tools(ctx: Any) -> None:
         description="List all profiles known to CloakBrowser-Manager.",
         emoji="📋",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_proxy_pool",
         toolset="cloak",
         schema=tools_manage.SCHEMA_PROXY_POOL,
@@ -294,7 +329,7 @@ def _register_manage_tools(ctx: Any) -> None:
         ),
         emoji="🌐",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_detect_captcha",
         toolset="cloak",
         schema=tools_manage.SCHEMA_DETECT_CAPTCHA,
@@ -311,7 +346,7 @@ def _register_manage_tools(ctx: Any) -> None:
         ),
         emoji="🔍",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="cloak_solve_captcha",
         toolset="cloak",
         schema=tools_manage.SCHEMA_SOLVE_CAPTCHA,
@@ -354,7 +389,7 @@ def _register_gmail_factory_tools(ctx: Any) -> int:
     Returns the number of tools registered (always 4 in this build) so the
     startup log can report the actual count.
     """
-    ctx.register_tool(
+    register_tool(ctx, 
         name="gmail_factory_status",
         toolset="gmail_factory",
         schema=gmail_factory.SCHEMA_STATUS,
@@ -367,7 +402,7 @@ def _register_gmail_factory_tools(ctx: Any) -> int:
         ),
         emoji="🧪",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="gmail_factory_create",
         toolset="gmail_factory",
         schema=gmail_factory.SCHEMA_CREATE,
@@ -381,7 +416,7 @@ def _register_gmail_factory_tools(ctx: Any) -> int:
         ),
         emoji="📧",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="gmail_factory_list",
         toolset="gmail_factory",
         schema=gmail_factory.SCHEMA_LIST,
@@ -393,7 +428,7 @@ def _register_gmail_factory_tools(ctx: Any) -> int:
         ),
         emoji="📒",
     )
-    ctx.register_tool(
+    register_tool(ctx, 
         name="gmail_factory_warmup",
         toolset="gmail_factory",
         schema=gmail_factory.SCHEMA_WARMUP,
@@ -411,7 +446,7 @@ def _register_gmail_factory_tools(ctx: Any) -> int:
 
 def _register_input_overrides(ctx: Any) -> None:
     """Toolset 'browser' — navigate override + humanized input overrides."""
-    ctx.register_tool(
+    register_tool(ctx, 
         name="browser_navigate",
         toolset="browser",
         schema=tools_browser.SCHEMA_NAVIGATE,
@@ -434,7 +469,7 @@ def _register_input_overrides(ctx: Any) -> None:
         ("browser_scroll", tools_input.SCHEMA_SCROLL, tools_input.browser_scroll, "Scroll the page (delta) or bring an element into view."),
     ]
     for name, schema, handler, desc in overrides:
-        ctx.register_tool(
+        register_tool(ctx, 
             name=name,
             toolset="browser",
             schema=schema,

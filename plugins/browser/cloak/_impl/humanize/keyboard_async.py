@@ -29,8 +29,10 @@ Math/timing attribution: pydoll (autoscrape-labs, MIT).
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import random
-from typing import Any, Optional, Protocol
+from typing import Any, Optional, Protocol, Tuple
 
 from .constants import (
     DEFAULT_TYPO_PROBABILITY,
@@ -38,6 +40,8 @@ from .constants import (
     TYPO_WEIGHTS,
     TypoType,
 )
+
+logger = logging.getLogger(__name__)
 
 # Cloakbrowser stores SHIFT symbol metadata in its sync sibling. We pull
 # those from the ORIGINAL cloak module — but lazily on first use, so that
@@ -113,12 +117,15 @@ async def async_human_type(
             continue
 
         # Decide whether to fire a typo on this char.
-        typo_prob = float(getattr(cfg, "mistype_chance", DEFAULT_TYPO_PROBABILITY))
+        typo_prob = _typo_probability(cfg)
+        typed_current = False
         consumed_next = False
         if random.random() < typo_prob and (ch.isalnum() or ch == " "):
-            consumed_next = await _dispatch_typo(page, raw, ch, next_ch, cfg, cdp_session)
+            typed_current, consumed_next = await _dispatch_typo(
+                page, raw, ch, next_ch, cfg, cdp_session
+            )
 
-        if not consumed_next:
+        if not typed_current:
             # Actually type the character.
             if ch.isupper() and ch.isalpha():
                 await _type_shifted(raw, ch, cfg)
@@ -230,9 +237,22 @@ async def _dispatch_typo(
     next_ch: Optional[str],
     cfg: Any,
     cdp_session: Any,
-) -> bool:
-    """Pick one of the 5 typo varieties, execute it, return True iff the
-    typo consumed the next character (i.e. caller must skip it).
+) -> Tuple[bool, bool]:
+    """Pick one of the 5 typo varieties and execute it.
+
+    Returns ``(typed_current, consumed_next)``:
+
+    * ``typed_current`` — this handler already emitted ``ch``, so the caller
+      must NOT type it again.
+    * ``consumed_next`` — it also emitted ``next_ch``, so the caller must
+      advance the index by two.
+
+    These are genuinely independent, and collapsing them into one flag is what
+    made ``adjacent``/``double``/``skip`` leave a duplicated character in the
+    field: each of them ends by typing ``ch`` correctly, reported "next not
+    consumed", and the caller then typed ``ch`` a second time. Those three
+    varieties carry 75% of the typo weight, so roughly 1.5% of all characters
+    came out doubled — ~36% of a 30-character email.
 
     Falls back to typing the intended character normally if the picked
     typo can't apply (no QWERTY neighbour, no next char for transpose, etc.).
@@ -242,24 +262,24 @@ async def _dispatch_typo(
     if typo_type == TypoType.ADJACENT:
         wrong = _nearby_key(ch)
         if wrong is None or wrong == ch:
-            return False
+            return False, False
         await _do_adjacent(page, raw, ch, wrong, cfg, cdp_session)
-        return False
+        return True, False
 
     if typo_type == TypoType.TRANSPOSE and next_ch and next_ch.isalpha():
         await _do_transpose(page, raw, ch, next_ch, cfg, cdp_session)
-        return True
+        return True, True
 
     if typo_type == TypoType.DOUBLE:
         await _do_double(page, raw, ch, cfg, cdp_session)
-        return False
+        return True, False
 
     if typo_type == TypoType.SKIP:
         # Hesitate before typing — pydoll's "skip" type doesn't actually skip,
         # it adds a thinking pause then types normally.
         await _sleep_range_ms(getattr(cfg, "typing_pause_range", (150, 300)))
         await _type_intended(page, raw, ch, cfg, cdp_session)
-        return False
+        return True, False
 
     if typo_type == TypoType.MISSED_SPACE and ch == " " and next_ch:
         # Forgot the space, type next char, realise, backspace, re-type space + next.
@@ -272,10 +292,10 @@ async def _dispatch_typo(
         await _type_normal(raw, " ", cfg)
         await _sleep_range_ms(getattr(cfg, "mistype_delay_correct", (50, 150)))
         await _type_intended(page, raw, next_ch, cfg, cdp_session)
-        return True
+        return True, True
 
-    # Fallback — couldn't apply the picked typo, just type normally.
-    return False
+    # Fallback — couldn't apply the picked typo, let the caller type normally.
+    return False, False
 
 
 async def _do_adjacent(
@@ -354,6 +374,27 @@ async def _type_intended(
 # ----------------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------------
+
+
+def _typo_probability(cfg: Any) -> float:
+    """Per-character chance of firing a typo.
+
+    ``CLOAK_MISTYPE_CHANCE`` overrides the preset; ``0`` turns typo simulation
+    off entirely. Timing realism — key hold, inter-character jitter, thinking
+    pauses — is untouched either way, and those are what a detector actually
+    measures. Worth turning off while filling identifiers (email, password,
+    coupon codes) where a surviving artifact costs more than it buys.
+    """
+    override = os.environ.get("CLOAK_MISTYPE_CHANCE", "").strip()
+    if override:
+        try:
+            return min(1.0, max(0.0, float(override)))
+        except ValueError:
+            logger.warning(
+                "CLOAK_MISTYPE_CHANCE=%r is not a number; using the preset value",
+                override,
+            )
+    return float(getattr(cfg, "mistype_chance", DEFAULT_TYPO_PROBABILITY))
 
 
 def _pick_typo_type() -> TypoType:

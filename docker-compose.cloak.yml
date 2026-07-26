@@ -47,6 +47,12 @@ services:
       # proxy or tunnel; `manager` itself only exists inside this network.
       CLOAK_MANAGER_BROWSER_URL: ${CLOAK_MANAGER_BROWSER_URL:-http://127.0.0.1:${CLOAK_MANAGER_PORT:-8180}}
       CLOAK_CDP_PROXY_BASE: http://bridge:8081
+      # Boot defaults for the proxy policy. Both are also readable from
+      # manager.env at call time, and the file wins — the dashboard toggle
+      # lives there and must reach the gateway without a container restart.
+      CLOAK_USE_PROXY_POOL: ${CLOAK_USE_PROXY_POOL:-0}
+      # 1 = never create a profile that would egress without a proxy.
+      CLOAK_REQUIRE_PROXY: ${CLOAK_REQUIRE_PROXY:-0}
     volumes: &hermes_volumes
       - hermes-data:/opt/data
     command: ["config", "set", "browser.cloud_provider", "cloak"]

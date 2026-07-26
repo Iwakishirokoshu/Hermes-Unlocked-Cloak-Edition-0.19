@@ -417,6 +417,8 @@ def register(ctx: Any) -> None:
     """Register the 4 hybrid tools in toolset `cloak_hybrid`."""
     import json
 
+    from . import register_tool as _register_tool
+
     def _wrap(fn: Any) -> Any:
         async def handler(args: dict, **kw: Any) -> str:
             result = await fn(args, **kw)
@@ -424,7 +426,7 @@ def register(ctx: Any) -> None:
 
         return handler
 
-    ctx.register_tool(
+    _register_tool(ctx, 
         name="cloak_api_call",
         toolset="cloak_hybrid",
         schema=SCHEMA_API_CALL,
@@ -438,7 +440,7 @@ def register(ctx: Any) -> None:
         ),
         emoji="🌐",
     )
-    ctx.register_tool(
+    _register_tool(ctx, 
         name="cloak_save_har",
         toolset="cloak_hybrid",
         schema=SCHEMA_SAVE_HAR,
@@ -451,7 +453,7 @@ def register(ctx: Any) -> None:
         ),
         emoji="📼",
     )
-    ctx.register_tool(
+    _register_tool(ctx, 
         name="cloak_extract",
         toolset="cloak_hybrid",
         schema=SCHEMA_EXTRACT,
@@ -464,7 +466,7 @@ def register(ctx: Any) -> None:
         ),
         emoji="📦",
     )
-    ctx.register_tool(
+    _register_tool(ctx, 
         name="cloak_shadow_query",
         toolset="cloak_hybrid",
         schema=SCHEMA_SHADOW_QUERY,

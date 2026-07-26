@@ -66,6 +66,24 @@ def _prepare_profile_proxy(
     return proxy, claim_owner
 
 
+def _missing_name_error(tool: str, field: str) -> Dict[str, Any]:
+    """Fail-closed response for a create call that arrived without a name.
+
+    Hermes does not validate tool arguments against the declared JSON schema,
+    so a model that emits ``{}`` would otherwise create an unnamed profile —
+    unfindable by name, so every retry creates another one, and never carrying
+    a pool proxy because the pool is claimed per profile name.
+    """
+    return {
+        "error": (
+            f"{tool} requires a non-empty '{field}'. Pass a stable, unique name "
+            "(e.g. 'reg-<task-id>') so the profile can be found again and so a "
+            "pool proxy can be reserved for it."
+        ),
+        "code": "missing_name",
+    }
+
+
 def _release_pool_claim(claim_owner: Optional[str]) -> int:
     if not claim_owner:
         return 0
@@ -234,7 +252,9 @@ SCHEMA_DETECT_CAPTCHA = {
 async def cloak_create_profile(args: dict, **kw: Any) -> Dict[str, Any]:
     """Create a stealth profile on the manager. Returns the new profile record."""
     task_id = kw.get("task_id")
-    name = args.get("name", "")
+    name = str(args.get("name") or "").strip()
+    if not name:
+        return _missing_name_error("cloak_create_profile", "name")
     try:
         tags = _normalize_profile_tags(args.get("tags"))
     except ValueError as exc:
@@ -336,7 +356,7 @@ async def _launch_profile(
     binding_before = profile_state.get_binding(task_id)
     async with ManagerClient() as mgr:
         try:
-            profile_id = await _resolve_profile_id(mgr, profile)
+            profile_id = await _resolve_profile_id(mgr, profile, task_id=task_id)
             guard = _profile_switch_guard(
                 binding_before,
                 requested_profile_id=profile_id,
@@ -438,6 +458,9 @@ async def set_active_profile(
     allow_profile_switch: bool = False,
 ) -> Dict[str, Any]:
     """Core find-or-create + launch logic (used by hooks and cloak_set_active)."""
+    profile = str(profile or "").strip()
+    if not profile:
+        return _missing_name_error("cloak_set_active", "profile")
     binding_before = profile_state.get_binding(task_id)
     # Only the create branch needs a proxy; resolve from the pool lazily so we
     # never burn a pool slot when the profile already exists.
@@ -646,20 +669,29 @@ async def cloak_stop(args: dict, **kw: Any) -> Dict[str, Any]:
     if not profile_name and not profile_state.is_uuid(profile):
         profile_name = str(profile or "").strip()
 
+    already_stopped = False
     async with ManagerClient() as mgr:
         try:
-            profile_id = await _resolve_profile_id(mgr, profile)
-            if not profile_name:
-                try:
-                    record = await mgr.get_profile(profile_id)
-                    profile_name = str(record.get("name") or "")
-                except Exception:  # noqa: BLE001
-                    pass
-
-            await mgr.stop(profile_id)
-            cdp_abs = mgr.absolute_cdp_url(f"/api/profiles/{profile_id}/cdp")
+            profile_id = await _resolve_profile_id(mgr, profile, task_id=task_id)
         except ManagerError as exc:
             return {"error": redact_cdp_url(exc), "status_code": exc.status_code}
+        if not profile_name:
+            try:
+                record = await mgr.get_profile(profile_id)
+                profile_name = str(record.get("name") or "")
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            await mgr.stop(profile_id)
+        except ManagerError as exc:
+            # "Already stopped" is the state the caller asked for. Report it and
+            # still release the lease, pooled client and proxy claim — bailing
+            # out here used to strand all three and drive the agent into a
+            # retry loop against a profile that was already down.
+            if not _is_already_stopped(exc):
+                return {"error": redact_cdp_url(exc), "status_code": exc.status_code}
+            already_stopped = True
+        cdp_abs = mgr.absolute_cdp_url(f"/api/profiles/{profile_id}/cdp")
 
     await get_pool().drop(cdp_abs)
     if binding and binding.get("profile_id") == profile_id and binding.get("cdp_url"):
@@ -671,7 +703,11 @@ async def cloak_stop(args: dict, **kw: Any) -> Dict[str, Any]:
     # If we were active on this profile, clear the env.
     profile_state.clear_env_if_profile(profile_id, cdp_abs)
 
-    result: Dict[str, Any] = {"profile_id": profile_id, "stopped": True}
+    result: Dict[str, Any] = {
+        "profile_id": profile_id,
+        "stopped": True,
+        "already_stopped": already_stopped,
+    }
     try:
         from .. import session_leases
 
@@ -781,15 +817,42 @@ async def cloak_detect_captcha(args: dict | None = None, **kw: Any) -> Dict[str,
 # ----------------------------------------------------------------------------
 
 
-async def _resolve_profile_id(mgr: ManagerClient, profile: str) -> str:
-    """Accept either a UUID or a profile name; return the UUID."""
+async def _resolve_profile_id(
+    mgr: ManagerClient, profile: str, *, task_id: Any = None
+) -> str:
+    """Accept either a UUID or a profile name; return the UUID.
+
+    An empty argument resolves to the profile this task is bound to — never to
+    a name lookup. Manager happily stores profiles with an empty name, so a
+    blank lookup used to match whichever nameless leftover came first and then
+    stop/launch operated on a stranger's profile.
+    """
+    value = str(profile or "").strip()
+    if not value:
+        binding = profile_state.get_binding(task_id)
+        bound = str((binding or {}).get("profile_id") or "").strip()
+        if bound:
+            return bound
+        raise ManagerError(
+            400,
+            "",
+            "no profile was given and this task has no remembered Cloak profile; "
+            "pass profile=<id or name>",
+        )
     # Fast path: looks like a UUID, just use it.
-    if profile_state.is_uuid(profile):
-        return profile
-    existing = await mgr.find_profile_by_name(profile)
+    if profile_state.is_uuid(value):
+        return value
+    existing = await mgr.find_profile_by_name(value)
     if existing is None:
-        raise ManagerError(404, profile, "profile not found by name")
+        raise ManagerError(404, value, "profile not found by name")
     return existing["id"]
+
+
+def _is_already_stopped(exc: ManagerError) -> bool:
+    """True when Manager refused a stop because the profile is not running."""
+    if int(getattr(exc, "status_code", 0) or 0) not in (404, 409):
+        return False
+    return "not running" in str(getattr(exc, "body", "") or "").lower()
 
 
 def _profile_switch_guard(

@@ -28,6 +28,10 @@ def _clean_cloak_env(monkeypatch, tmp_path):
         "CLOAK_PROXY_POOL_FILE",
         "CLOAK_DIR",
         "CLOAK_ENABLE_GMAIL_FACTORY",
+        "CLOAK_MANAGER_ENV",
+        "CLOAK_PROXY",
+        "CLOAK_USE_PROXY_POOL",
+        "CLOAK_REQUIRE_PROXY",
     ):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setenv("CLOAK_DIR", str(tmp_path / "cloak"))
@@ -1034,3 +1038,381 @@ def test_bridge_readiness_cleans_temporary_profile(monkeypatch):
     assert ("POST", "/api/profiles/probe-profile/stop", None) in calls
     assert ("DELETE", "/api/profiles/probe-profile", None) in calls
 
+
+
+def test_pool_toggle_is_read_live_from_manager_env(tmp_path, monkeypatch):
+    """The dashboard writes manager.env from a *different* process than the
+    gateway that runs the tools. A value merged into os.environ at plugin-import
+    time is therefore stale the moment the operator flips the toggle."""
+    from plugins.browser.cloak import proxy_format as pf
+
+    env_file = tmp_path / "live" / "manager.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("CLOAK_MANAGER_ENV", str(env_file))
+
+    # Process env says off (what the gateway booted with).
+    monkeypatch.setenv("CLOAK_USE_PROXY_POOL", "0")
+    env_file.write_text("CLOAK_USE_PROXY_POOL=1\n", encoding="utf-8")
+    assert pf.pool_enabled() is True
+
+    # ...and back off again, still without a restart.
+    env_file.write_text("CLOAK_USE_PROXY_POOL=0\n# turned off in the UI\n", encoding="utf-8")
+    assert pf.pool_enabled() is False
+
+
+def test_process_env_used_when_manager_env_is_silent(tmp_path, monkeypatch):
+    from plugins.browser.cloak import proxy_format as pf
+
+    env_file = tmp_path / "quiet" / "manager.env"
+    env_file.parent.mkdir(parents=True, exist_ok=True)
+    env_file.write_text("CLOAK_IDLE_TIMEOUT_MIN=20\n", encoding="utf-8")
+    monkeypatch.setenv("CLOAK_MANAGER_ENV", str(env_file))
+    monkeypatch.setenv("CLOAK_USE_PROXY_POOL", "1")
+
+    assert pf.pool_enabled() is True
+
+
+def test_require_proxy_refuses_direct_egress(monkeypatch):
+    from plugins.browser.cloak.proxy_format import ProxyResolutionError, resolve_proxy
+
+    monkeypatch.setenv("CLOAK_REQUIRE_PROXY", "1")
+    with pytest.raises(ProxyResolutionError):
+        resolve_proxy("", use_pool=False, fail_closed=True)
+
+    # Explicit proxy still satisfies the requirement.
+    assert resolve_proxy("socks5://h:1", use_pool=False) == "socks5://h:1"
+
+
+def test_create_profile_rejects_empty_name(monkeypatch):
+    """Hermes does not validate tool args against the schema, so a model that
+    emits `{}` must be stopped here — an unnamed profile is unfindable, so every
+    retry creates another one and none of them can claim a pool proxy."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    def explode(*args, **kwargs):
+        raise AssertionError("manager must not be called without a profile name")
+
+    monkeypatch.setattr(tm, "ManagerClient", explode)
+
+    result = asyncio.run(tm.cloak_create_profile({}))
+    assert result["code"] == "missing_name"
+
+    result = asyncio.run(tm.cloak_set_active({"profile": "   "}))
+    assert result["code"] == "missing_name"
+
+
+def test_provider_backfills_proxy_on_existing_profile(monkeypatch):
+    """find-or-create only set the proxy on the create branch, so a profile made
+    while the pool was off stayed proxy-less for every later session."""
+    from plugins.browser.cloak.provider import CloakBrowserProvider
+
+    provider = CloakBrowserProvider()
+    monkeypatch.setattr(
+        provider, "_resolve_profile_proxy", lambda name: ("socks5://pool:1080", "profile:p")
+    )
+    updated = {}
+
+    class Resp:
+        ok = True
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"id": "p1", "name": "p", "proxy": "socks5://pool:1080"}
+
+    def fake_put(url, **kwargs):
+        updated["url"] = url
+        updated["json"] = kwargs.get("json")
+        return Resp()
+
+    monkeypatch.setattr("plugins.browser.cloak.provider.requests.put", fake_put)
+
+    out = provider._adopt_existing_profile(
+        "http://127.0.0.1:8080", {"id": "p1", "name": "p", "proxy": None}
+    )
+    assert out["proxy"] == "socks5://pool:1080"
+    assert updated["url"].endswith("/api/profiles/p1")
+    assert updated["json"] == {"proxy": "socks5://pool:1080"}
+
+
+def test_provider_keeps_existing_profile_proxy(monkeypatch):
+    from plugins.browser.cloak.provider import CloakBrowserProvider
+
+    provider = CloakBrowserProvider()
+
+    def explode(*args, **kwargs):
+        raise AssertionError("a profile that already has a proxy must not be touched")
+
+    monkeypatch.setattr(provider, "_resolve_profile_proxy", explode)
+    monkeypatch.setattr("plugins.browser.cloak.provider.requests.put", explode)
+
+    profile = {"id": "p1", "name": "p", "proxy": "socks5://kept:1080"}
+    assert provider._adopt_existing_profile("http://127.0.0.1:8080", profile) is profile
+
+
+def test_proxy_pool_skill_has_no_hardcoded_home(tmp_path):
+    """The doc used to hardcode /root/.hermes/...; in the Docker image the agent
+    runs as a non-root user whose Hermes home is the data dir, so it got EACCES
+    and burned turns instead of loading the pool."""
+    text = Path("skills/cloak-proxy-pool/SKILL.md").read_text(encoding="utf-8")
+    assert "/root/.hermes/skills" not in text
+    assert "cloak_proxy_pool(action=" in text
+
+
+def test_registered_cloak_tools_expose_their_arguments():
+    """The registry publishes {"type":"function","function":{**schema,"name":...}},
+    so `schema` must be the function object. Handing it a bare parameters object
+    left every cloak_* tool with `parameters: {}` — the model could only ever
+    call them with `{}`."""
+    from tools.schema_sanitizer import sanitize_tool_schemas
+    from plugins.browser.cloak._impl import as_function_schema, tools_manage
+
+    recorded: dict = {}
+
+    class Ctx:
+        def register_tool(self, *, name, schema, **kwargs):
+            recorded[name] = schema
+
+    from plugins.browser.cloak._impl import register_tool
+
+    register_tool(
+        Ctx(),
+        name="cloak_create_profile",
+        toolset="cloak",
+        schema=tools_manage.SCHEMA_CREATE,
+        handler=lambda args, **kw: "",
+        description="Create a stealth browser profile.",
+    )
+
+    published = sanitize_tool_schemas(
+        [{"type": "function", "function": {**recorded["cloak_create_profile"], "name": "cloak_create_profile"}}]
+    )
+    params = published[0]["function"]["parameters"]
+    assert "name" in params["properties"], params
+    assert "proxy" in params["properties"]
+    assert "use_pool" in params["properties"]
+    assert params["required"] == ["name"]
+
+    # Already function-shaped schemas pass through untouched.
+    fn_shaped = {"description": "d", "parameters": {"type": "object", "properties": {"a": {}}}}
+    assert as_function_schema(fn_shaped) is fn_shaped
+
+
+def test_every_cloak_registration_is_function_shaped():
+    """Guard the whole plugin, not just one tool: no registration may reach the
+    registry with a bare parameters object again."""
+    from plugins.browser.cloak import _impl
+
+    seen: dict = {}
+
+    class Ctx:
+        def register_tool(self, *, name, schema, **kwargs):
+            seen[name] = schema
+
+        def register_hook(self, *args, **kwargs):
+            pass
+
+    _impl._register_manage_tools(Ctx())
+    _impl._register_input_overrides(Ctx())
+
+    assert seen, "no tools registered"
+    for name, schema in seen.items():
+        assert isinstance(schema.get("parameters"), dict), f"{name} is not function-shaped"
+        assert schema["parameters"].get("type") == "object", name
+
+
+def test_blank_profile_never_matches_a_nameless_profile(monkeypatch):
+    """Manager stores profiles with an empty name; a blank lookup used to match
+    one of those leftovers, so cloak_stop/cloak_launch hit a stranger's profile."""
+    import asyncio
+    from plugins.browser.cloak._impl.manager_client import ManagerClient
+
+    mgr = ManagerClient(base_url="http://127.0.0.1:8080", auth_token=None)
+
+    async def fake_list():
+        return [{"id": "nameless", "name": ""}, {"id": "real", "name": "reg-1"}]
+
+    monkeypatch.setattr(mgr, "list_profiles", fake_list)
+    try:
+        assert asyncio.run(mgr.find_profile_by_name("")) is None
+        assert asyncio.run(mgr.find_profile_by_name("   ")) is None
+        assert asyncio.run(mgr.find_profile_by_name("reg-1"))["id"] == "real"
+    finally:
+        asyncio.run(mgr.aclose())
+
+
+def test_resolve_profile_id_falls_back_to_task_binding(monkeypatch):
+    import asyncio
+    from plugins.browser.cloak._impl import profile_state
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    monkeypatch.setattr(
+        profile_state, "get_binding", lambda task_id=None: {"profile_id": "bound-id"}
+    )
+
+    class Mgr:
+        async def find_profile_by_name(self, name):
+            raise AssertionError("blank profile must resolve from the binding, not by name")
+
+    assert asyncio.run(tm._resolve_profile_id(Mgr(), "", task_id="t1")) == "bound-id"
+
+    monkeypatch.setattr(profile_state, "get_binding", lambda task_id=None: None)
+    with pytest.raises(tm.ManagerError):
+        asyncio.run(tm._resolve_profile_id(Mgr(), "", task_id="t1"))
+
+
+def test_stop_is_idempotent_when_profile_is_not_running():
+    from plugins.browser.cloak._impl.manager_client import ManagerError
+    from plugins.browser.cloak._impl.tools_manage import _is_already_stopped
+
+    assert _is_already_stopped(ManagerError(404, '{"detail":"Profile is not running"}', "stop failed"))
+    assert _is_already_stopped(ManagerError(409, "profile is NOT RUNNING", "stop failed"))
+    assert not _is_already_stopped(ManagerError(404, '{"detail":"Profile not found"}', "stop failed"))
+    assert not _is_already_stopped(ManagerError(500, "boom", "stop failed"))
+
+
+def test_bare_snapshot_ref_is_not_treated_as_a_css_selector():
+    """browser_snapshot emits bare refs (`e5`); the locator mapping only knew
+    `@e5`. A bare ref used to become `page.locator("e5")` — a CSS lookup for a
+    nonexistent <e5> tag that burned the full timeout twice before failing."""
+    from plugins.browser.cloak._impl.tools_input import _normalize_target
+
+    assert _normalize_target("e5") == "@e5"
+    assert _normalize_target("@e5") == "@e5"
+    assert _normalize_target("E12") == "@e12"
+    # Real selectors must survive untouched, whichever slot they arrive in.
+    assert _normalize_target("", "input[type='email']") == "input[type='email']"
+    assert _normalize_target("div.card") == "div.card"
+    assert _normalize_target("", "") == ""
+
+
+def test_snapshot_ref_maps_onto_playwright_aria_ref():
+    from plugins.browser.cloak._impl.tools_input import _locator_for, _normalize_target
+
+    seen = []
+
+    class Page:
+        def locator(self, sel):
+            seen.append(sel)
+            return sel
+
+    _locator_for(Page(), _normalize_target("e9"))
+    assert seen == ["aria-ref=e9"]
+
+
+def test_text_input_refuses_a_bare_ref_immediately():
+    """The humanized-input contract refuses refs for typing. That refusal has to
+    fire on `e5` too, otherwise the model waits out two timeouts to learn it."""
+    import asyncio
+    from plugins.browser.cloak._impl import tools_input as ti
+
+    def explode(*args, **kwargs):
+        raise AssertionError("must refuse before touching the browser pool")
+
+    original = ti._hold_page
+    ti._hold_page = explode
+    try:
+        for handler in (ti.browser_type, ti.browser_fill):
+            out = asyncio.run(handler({"ref": "e5", "text": "hello"}))
+            assert out["error"] == "humanized_selector_required", out
+            assert out["ref"] == "@e5"
+    finally:
+        ti._hold_page = original
+
+
+class _KeyBuffer:
+    """Minimal stand-in for the raw keyboard: keeps what the field would hold."""
+
+    def __init__(self) -> None:
+        self.text = ""
+
+    async def down(self, key: str) -> None:
+        if key == "Backspace":
+            self.text = self.text[:-1]
+        elif len(key) == 1:
+            self.text += key
+
+    async def up(self, key: str) -> None:
+        return None
+
+    async def type(self, text: str) -> None:
+        self.text += text
+
+    async def insert_text(self, text: str) -> None:
+        self.text += text
+
+
+class _FastCfg:
+    """Preset with every delay collapsed and typos always firing."""
+
+    mistype_chance = 1.0
+    key_hold = (0, 0)
+    mistype_delay_notice = (0, 0)
+    mistype_delay_correct = (0, 0)
+    typing_pause_range = (0, 0)
+    typing_pause_chance = 0.0
+    typing_delay = 0
+    typing_delay_spread = 0
+    shift_down_delay = (0, 0)
+
+
+def test_every_typo_variety_still_lands_the_intended_text(monkeypatch):
+    """Each typo variety must self-correct. `adjacent`, `double` and `skip` all
+    end by typing the character correctly but reported it as untyped, so the
+    caller typed it a second time and the duplicate survived — 75% of the typo
+    weight, i.e. ~1.5% of every character."""
+    import asyncio
+    from plugins.browser.cloak._impl.humanize import keyboard_async as ka
+    from plugins.browser.cloak._impl.humanize.constants import TypoType
+
+    # Shift-symbol tables live in cloakbrowser, which the unit env does not
+    # install; the text below has none, so stub the probe out.
+    monkeypatch.setattr(ka, "_is_shift_symbol", lambda ch: False)
+    monkeypatch.delenv("CLOAK_MISTYPE_CHANCE", raising=False)
+    intended = "ab cd ef"
+    for typo_type in TypoType:
+        monkeypatch.setattr(ka, "_pick_typo_type", lambda t=typo_type: t)
+        buf = _KeyBuffer()
+        asyncio.run(ka.async_human_type(None, buf, intended, _FastCfg(), None))
+        assert buf.text == intended, f"{typo_type} corrupted the text: {buf.text!r}"
+
+
+def test_mistype_chance_can_be_turned_off(monkeypatch):
+    import asyncio
+    from plugins.browser.cloak._impl.humanize import keyboard_async as ka
+
+    def explode() -> None:
+        raise AssertionError("no typo may fire when CLOAK_MISTYPE_CHANCE=0")
+
+    monkeypatch.setattr(ka, "_pick_typo_type", explode)
+    monkeypatch.setattr(ka, "_is_shift_symbol", lambda ch: False)
+    monkeypatch.setenv("CLOAK_MISTYPE_CHANCE", "0")
+
+    intended = "jaidon.avalynn+edu@outlook.com".replace("+", "").replace("@", "")
+    buf = _KeyBuffer()
+    asyncio.run(ka.async_human_type(None, buf, intended, _FastCfg(), None))
+    assert buf.text == intended
+
+    # A malformed override must fall back to the preset, not crash typing.
+    monkeypatch.setenv("CLOAK_MISTYPE_CHANCE", "not-a-number")
+    assert ka._typo_probability(_FastCfg()) == 1.0
+
+
+def test_idle_reaper_returns_the_pooled_proxy(tmp_path, monkeypatch):
+    """cloak_stop releases the claim, but the reaper stops profiles straight
+    through Manager, so every auto-closed profile drained one proxy for good."""
+    from plugins.browser.cloak import proxy_format as pf
+    from plugins.browser.cloak._impl import idle_reaper
+
+    pf.set_proxies(["http://u:p@host-a:8080", "http://u:p@host-b:8080"])
+    claimed = pf.claim_proxy(pf.profile_claim_owner("acc-idle"))
+    assert claimed
+    assert sum(1 for e in pf.load_pool()["proxies"] if e.get("assigned_to")) == 1
+
+    released = idle_reaper._release_pool_claim("profile-uuid", "acc-idle")
+    assert released == 1
+    assert all(not e.get("assigned_to") for e in pf.load_pool()["proxies"])
+
+    # Idempotent, and never raises for a profile that holds nothing.
+    assert idle_reaper._release_pool_claim("profile-uuid", "acc-idle") == 0

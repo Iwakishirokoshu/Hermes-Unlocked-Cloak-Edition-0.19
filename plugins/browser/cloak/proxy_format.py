@@ -58,14 +58,70 @@ def pool_file() -> str:
     return str(proxy_pool_file())
 
 
+# --- live settings ---------------------------------------------------------
+# manager.env is merged into os.environ once, at plugin-import time. The
+# dashboard runs in a *different* process from the gateway that executes the
+# tools, so a toggle flipped in the UI never reaches the agent until a
+# restart. Reading the file on demand (mtime-cached) closes that gap.
+_ENV_FILE_CACHE: dict = {}
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _manager_env_settings() -> dict:
+    """Parse manager.env, cached on (mtime, size). Never raises."""
+    try:
+        from plugins.browser.cloak.paths import manager_env_file
+
+        path = str(manager_env_file())
+    except Exception:  # noqa: BLE001
+        path = os.environ.get("CLOAK_MANAGER_ENV", "")
+    if not path:
+        return {}
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return {}
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    cached = _ENV_FILE_CACHE.get(path)
+    if cached and cached[0] == stamp:
+        return cached[1]
+    try:
+        from plugins.browser.cloak.env_file import parse_env_file
+
+        parsed = parse_env_file(path)
+    except OSError:
+        return {}
+    _ENV_FILE_CACHE[path] = (stamp, parsed)
+    return parsed
+
+
+def setting(key: str, default: str = "") -> str:
+    """Read a Cloak setting; manager.env wins over a possibly stale process env.
+
+    manager.env is the mutable, dashboard-owned store — whatever it defines is
+    the operator's most recent decision. The process env (docker-compose,
+    systemd, shell) supplies the value only when the file is silent on the key.
+    """
+    value = _manager_env_settings().get(key)
+    if value is not None:
+        return value
+    return os.environ.get(key, default)
+
+
 def pool_enabled() -> bool:
     """Auto-assign-from-pool toggle (``CLOAK_USE_PROXY_POOL`` truthy)."""
-    return os.environ.get("CLOAK_USE_PROXY_POOL", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
+    return setting("CLOAK_USE_PROXY_POOL").strip().lower() in _TRUTHY
+
+
+def require_proxy() -> bool:
+    """Fail-closed switch: refuse to create a profile with no proxy at all.
+
+    Off by default. Turn it on (``CLOAK_REQUIRE_PROXY=1``) when every profile
+    must egress through a proxy — the profile-creation paths then raise
+    :class:`ProxyResolutionError` instead of quietly creating a direct-egress
+    profile.
+    """
+    return setting("CLOAK_REQUIRE_PROXY").strip().lower() in _TRUTHY
 
 
 # ---------------------------------------------------------------------------
@@ -520,4 +576,9 @@ def resolve_proxy(
             return pooled
         if fail_closed:
             raise ProxyResolutionError("Proxy pool is empty or all proxies are already assigned.")
+    if require_proxy():
+        raise ProxyResolutionError(
+            "CLOAK_REQUIRE_PROXY is on and no proxy was resolved: pass an explicit "
+            "proxy, or enable the pool (CLOAK_USE_PROXY_POOL=1) and load it first."
+        )
     return ""

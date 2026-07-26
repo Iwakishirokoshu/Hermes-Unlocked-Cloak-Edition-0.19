@@ -111,10 +111,18 @@ class ManagerClient:
         return await self._request("GET", f"/api/profiles/{profile_id}")
 
     async def find_profile_by_name(self, name: str) -> Optional[Dict[str, Any]]:
-        """Look up a profile by its `name` field, return None if not found."""
+        """Look up a profile by its `name` field, return None if not found.
+
+        A blank name never matches: Manager accepts profiles with an empty
+        name, so a blank lookup would otherwise return whichever nameless
+        record happens to come first.
+        """
+        target = str(name or "").strip()
+        if not target:
+            return None
         profiles = await self.list_profiles()
         for p in profiles:
-            if p.get("name") == name:
+            if p.get("name") == target:
                 return p
         return None
 

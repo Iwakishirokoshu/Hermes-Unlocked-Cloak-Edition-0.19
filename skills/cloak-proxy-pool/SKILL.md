@@ -16,7 +16,11 @@ triggers:
 
 ## Хранилище
 
-Один файл: `~/.hermes/cloak/proxies.json` (формат — массив объектов).
+Один файл — `<cloak-dir>/proxies.json`, формат массив объектов. Каталог
+разрешается в таком порядке: `CLOAK_PROXY_POOL_FILE` → `CLOAK_POOL_DIR` →
+`CLOAK_DIR` → `/etc/cloak/` → `$HOME/.hermes/cloak/`. В Docker-поставке
+`$HOME` агента равен каталогу данных Hermes, поэтому путь не совпадает с
+`/root/`. Никогда не вписывай путь руками — спроси его у инструмента.
 
 ```json
 [
@@ -25,29 +29,40 @@ triggers:
 ]
 ```
 
-## CLI хелпер
+## Основной путь — инструмент `cloak_proxy_pool`
 
-`/root/.hermes/skills/cloak-proxy-pool/pool.py` — единственный исполняемый файл скилла. Все операции атомарные (через временный файл + rename), так что параллельные регистрации не перетрут друг друга.
+Он работает с тем же файлом и той же блокировкой, не зависит от путей и
+не требует терминала. Используй его по умолчанию.
+
+```text
+cloak_proxy_pool(action="add", text="<строки прокси, по одной на строку>")
+cloak_proxy_pool(action="list")     # → count, strategy, auto_assign, masked-список
+cloak_proxy_pool(action="clear")
+```
+
+`action="next"` / `action="release"` вручную вызывать не нужно —
+`cloak_create_profile(use_pool=true)` резервирует прокси сам.
+
+## CLI хелпер (только вне Cloak toolset)
+
+`pool.py` лежит в каталоге самого скилла. Путь бери из окружения, а не из
+этого документа:
 
 ```bash
-# Залить новый пул (мерж — дубликаты по url пропускаются)
-python3 pool.py load <<EOF
+POOL_PY="$(find "$HOME" /opt/hermes -maxdepth 4 -path '*cloak-proxy-pool/pool.py' -print -quit)"
+
+python3 "$POOL_PY" load <<'EOF'
 1.2.3.4:8080:user:pass
-5.6.7.8:8080:user:pass
-http://user:pass@9.10.11.12:3128
 socks5://user:pass@13.14.15.16:1080
 EOF
 
-# Атомарно выдать следующий неиспользованный (помечает assigned_to)
-python3 pool.py next <profile_name>
-# → JSON: {"url": "http://...", "index": 1}
-
-# Освободить (если профиль удалён)
-python3 pool.py release <profile_name>
-
-# Статус: total / free / used
-python3 pool.py status
+python3 "$POOL_PY" status              # total / free / used
+python3 "$POOL_PY" next <profile_name> # атомарно выдать и пометить assigned_to
+python3 "$POOL_PY" release <profile_name>
 ```
+
+Все операции атомарные (временный файл + rename), так что параллельные
+регистрации не перетрут друг друга.
 
 ## Поддерживаемые форматы при `load`
 

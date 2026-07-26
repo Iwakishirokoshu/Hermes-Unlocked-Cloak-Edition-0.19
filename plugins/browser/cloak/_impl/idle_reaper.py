@@ -87,6 +87,32 @@ def _manager() -> tuple:
     return base, headers
 
 
+def _release_pool_claim(profile_id: str, profile_name: str) -> int:
+    """Hand the profile's pooled proxy back when the reaper closes it.
+
+    ``cloak_stop`` releases the claim, but the reaper stops profiles straight
+    through Manager's API, so every auto-closed profile used to take one proxy
+    out of the pool permanently. Never raises — reaping must not depend on it.
+    """
+    released = 0
+    try:
+        from ..proxy_format import profile_claim_owner, release_proxy
+
+        owners = [profile_id]
+        if profile_name:
+            owners.append(profile_claim_owner(profile_name))
+        for owner in dict.fromkeys(o for o in owners if o):
+            released += release_proxy(owner)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "idle-reaper: stopped %s but could not release its proxy claim: %s",
+            profile_id, exc,
+        )
+    if released:
+        logger.info("idle-reaper: returned %d pooled proxy(ies) from %s", released, profile_id)
+    return released
+
+
 def _profile_last_activity(profile_id: str, now: float) -> float:
     """Effective last-activity ts for a profile: max over matching CDP URLs, or
     a freshly-seeded first-seen timestamp."""
@@ -132,6 +158,7 @@ def _reap_once(timeout_seconds: float) -> None:
                 "cloak idle-reaper: stopped profile %s (%s) after %.0f min idle",
                 prof.get("name") or pid, pid, idle / 60.0,
             )
+            _release_pool_claim(pid, str(prof.get("name") or ""))
             with _lock:
                 _first_seen.pop(pid, None)
                 for url in [u for u in _last_activity if pid in u]:

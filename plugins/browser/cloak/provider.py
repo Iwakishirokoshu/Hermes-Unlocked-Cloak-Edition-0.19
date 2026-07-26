@@ -226,14 +226,13 @@ class CloakBrowserProvider(BrowserProvider):
                 return profile
         return None
 
-    def _create_profile(self, base_url: str, name: str) -> Dict[str, Any]:
-        body = {
-            "name": name,
-            "humanize": True,
-            "human_preset": os.environ.get("CLOAK_HUMAN_PRESET", "default"),
-            "headless": os.environ.get("CLOAK_HEADLESS", "false").lower() == "true",
-            "geoip": True,
-        }
+    def _resolve_profile_proxy(self, name: str) -> tuple[str, str]:
+        """Return ``(proxy, claim_owner)`` for a profile about to use it.
+
+        Raises when the operator asked for a proxy (explicit, pool, or
+        ``CLOAK_REQUIRE_PROXY``) and none could be resolved — a stealth profile
+        that silently egresses from the host IP is worse than a hard failure.
+        """
         configured_proxy = os.environ.get("CLOAK_PROXY", "").strip()
         claim_owner = ""
         try:
@@ -252,6 +251,55 @@ class CloakBrowserProvider(BrowserProvider):
             )
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Cloak proxy configuration error: {redact_cdp_url(exc)}") from exc
+        return proxy, claim_owner
+
+    def _adopt_existing_profile(self, base_url: str, profile: Dict[str, Any]) -> Dict[str, Any]:
+        """Back-fill the proxy of a profile that was created without one.
+
+        find-or-create only ever set the proxy on the create branch, so a
+        profile that predates the pool (or was created while auto-assign was
+        off) stayed proxy-less for every later session.
+        """
+        if str(profile.get("proxy") or "").strip():
+            return profile
+        name = str(profile.get("name") or "")
+        profile_id = str(profile.get("id") or profile.get("profile_id") or "")
+        proxy, claim_owner = self._resolve_profile_proxy(name)
+        if not proxy or not profile_id:
+            return profile
+        try:
+            resp = requests.put(
+                f"{base_url}/api/profiles/{profile_id}",
+                headers=self._headers(),
+                json={"proxy": proxy},
+                timeout=30,
+            )
+        except requests.RequestException:
+            logger.warning(
+                "Cloak proxy back-fill outcome unknown; retaining proxy claim for %s", name
+            )
+            raise
+        if not resp.ok:
+            try:
+                _release_proxy_claim(claim_owner)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("Cloak: could not release proxy claim after update failure: %s", redact_cdp_url(exc))
+            raise RuntimeError(
+                f"Cloak could not attach a proxy to existing profile: "
+                f"{resp.status_code} {redact_cdp_url(resp.text[:200])}"
+            )
+        logger.info("Cloak: attached proxy to existing profile %s", name)
+        return resp.json() or profile
+
+    def _create_profile(self, base_url: str, name: str) -> Dict[str, Any]:
+        body = {
+            "name": name,
+            "humanize": True,
+            "human_preset": os.environ.get("CLOAK_HUMAN_PRESET", "default"),
+            "headless": os.environ.get("CLOAK_HEADLESS", "false").lower() == "true",
+            "geoip": True,
+        }
+        proxy, claim_owner = self._resolve_profile_proxy(name)
         if proxy:
             body["proxy"] = proxy
             logger.info("Cloak: profile %s using pool proxy", name)
@@ -379,6 +427,8 @@ class CloakBrowserProvider(BrowserProvider):
             profile = self._find_profile_by_name(base_url, profile_name)
             if profile is None:
                 profile = self._create_profile(base_url, profile_name)
+            else:
+                profile = self._adopt_existing_profile(base_url, profile)
             profile_id = str(profile.get("id") or profile.get("profile_id") or "")
             if not profile_id:
                 raise RuntimeError(f"Cloak profile has no id: {redact_cdp_url(profile)}")

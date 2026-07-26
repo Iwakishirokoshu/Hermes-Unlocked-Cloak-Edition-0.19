@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Dict, Optional
@@ -46,7 +47,7 @@ _SEL_SCHEMA = {
 SCHEMA_CLICK = {
     "type": "object",
     "properties": {
-        "ref": {"type": "string", "description": "Accessibility ref from snapshot, e.g. @e1"},
+        "ref": {"type": "string", "description": "Snapshot ref, e.g. e1 (the @e1 spelling is accepted too)."},
         "selector": {"type": "string", "description": "CSS selector (preferred for humanize)"},
         "timeout_ms": {"type": "integer", "default": 30000},
         "force": {"type": "boolean", "default": False},
@@ -56,7 +57,7 @@ SCHEMA_CLICK = {
 SCHEMA_TYPE = {
     "type": "object",
     "properties": {
-        "ref": {"type": "string", "description": "Snapshot reference. Cloak does not accept refs for text input; pass selector instead."},
+        "ref": {"type": "string", "description": "Snapshot ref. Cloak refuses refs for text input — pass a CSS selector such as input[type='email'] instead."},
         "selector": {"type": "string", "description": "CSS selector required for humanized text input, e.g. input[type='email']."},
         "text": {"type": "string"},
         "timeout_ms": {"type": "integer", "default": 30000},
@@ -123,8 +124,26 @@ SCHEMA_SCROLL = {
 # ----------------------------------------------------------------------------
 
 
+_SNAPSHOT_REF_RE = re.compile(r"^@?(e\d+)$", re.IGNORECASE)
+
+
+def _normalize_ref(ref: str) -> str:
+    """Accept both spellings of a snapshot reference.
+
+    ``browser_snapshot`` hands the model bare refs (``e5``) and the built-in
+    browser tools take them that way, but :func:`_locator_for` only recognises
+    the ``@e5`` spelling. A bare ref therefore fell through to
+    ``page.locator("e5")`` — a CSS lookup for a nonexistent ``<e5>`` tag that
+    burns the full timeout twice before failing, instead of resolving to
+    ``aria-ref=e5`` (click/hover) or being refused immediately (text input).
+    """
+    value = str(ref or "").strip()
+    match = _SNAPSHOT_REF_RE.match(value)
+    return f"@{match.group(1).lower()}" if match else value
+
+
 def _normalize_target(ref: str = "", selector: str = "") -> str:
-    return (ref or selector or "").strip()
+    return _normalize_ref(ref) or (selector or "").strip()
 
 
 def _humanized_selector_required(ref: str) -> Dict[str, Any]:
