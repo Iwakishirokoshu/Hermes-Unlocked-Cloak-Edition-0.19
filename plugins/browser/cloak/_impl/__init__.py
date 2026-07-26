@@ -140,7 +140,7 @@ def register(ctx: Any) -> None:
             "(set CLOAK_ENABLE_GMAIL_FACTORY=1 to enable)"
         )
     logger.info(
-        "hermes-plugin-cloak: registered 8 cloak_* tools (incl. captcha detect/solve, proxy pool) "
+        "hermes-plugin-cloak: registered 9 cloak_* tools (incl. captcha detect/solve, proxy pool) "
         "+ 7 browser_* overrides%s%s",
         f" + {hybrid_count} hybrid tools" if hybrid_count else "",
         f" + {gmail_count} gmail_factory_* tools" if gmail_count else "",
@@ -328,6 +328,18 @@ def _register_manage_tools(ctx: Any) -> None:
             "(or just enable auto-assign in the dashboard)."
         ),
         emoji="🌐",
+    )
+    register_tool(ctx, 
+        name="cloak_arkose_blob",
+        toolset="cloak",
+        schema=tools_manage.SCHEMA_ARKOSE_BLOB,
+        handler=_wrap_async_tool(tools_manage.cloak_arkose_blob),
+        is_async=True,
+        description=(
+            "Collect the Arkose data-exchange blob captured from network traffic. "
+            "Required by cloak_solve_captcha on sites that gate Arkose per session."
+        ),
+        emoji="🧩",
     )
     register_tool(ctx, 
         name="cloak_detect_captcha",

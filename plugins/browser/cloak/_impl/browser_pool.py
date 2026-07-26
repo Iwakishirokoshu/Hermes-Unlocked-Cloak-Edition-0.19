@@ -239,6 +239,16 @@ class BrowserPool:
         pages = context.pages
         page = pages[0] if pages else await context.new_page()
 
+        # Arm the Arkose blob capture on the context: the blob only exists in a
+        # network response body, and by the time anyone asks for it the request
+        # has already gone out with the click that submitted the form.
+        try:
+            from . import arkose
+
+            arkose.install_capture(context, cdp_url)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Arkose capture not armed: %s", exc)
+
         if self._human_cfg is None or self._human_preset != preset:
             self._human_cfg = resolve_config(preset)
             self._human_preset = preset

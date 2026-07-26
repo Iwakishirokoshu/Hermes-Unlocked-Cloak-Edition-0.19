@@ -19,8 +19,10 @@ Hermes's native browser tools — they read this env on every invocation
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
 from agent.redact import redact_cdp_url
@@ -243,6 +245,35 @@ SCHEMA_SOLVE_CAPTCHA = {
     },
     "required": ["kind", "url"],
 }
+
+SCHEMA_ARKOSE_BLOB = {
+    "type": "object",
+    "properties": {
+        "wait_ms": {
+            "type": "integer",
+            "default": 0,
+            "description": (
+                "Wait up to this long (max 60000) for the blob to appear. Use it right "
+                "after clicking the button that submits the form — the site issues the "
+                "blob as part of that request."
+            ),
+        },
+        "peek": {
+            "type": "boolean",
+            "default": False,
+            "description": (
+                "Look without consuming. By default the blob is handed over once and "
+                "forgotten, because a blob and the token solved from it are single-use."
+            ),
+        },
+    },
+    "description": (
+        "Collect the Arkose data-exchange blob captured from the page's network "
+        "traffic. Pass it to cloak_solve_captcha as extra.blob — sites that gate "
+        "Arkose per session cannot be solved without it, whatever the public key."
+    ),
+}
+
 
 SCHEMA_DETECT_CAPTCHA = {
     "type": "object",
@@ -885,6 +916,49 @@ async def cloak_solve_captcha(args: dict, **kw: Any) -> str:
     except Exception as exc:  # noqa: BLE001
         logger.error("cloak_solve_captcha unexpected error: %s", redact_cdp_url(exc))
         return MANUAL_INTERVENTION_REQUIRED
+
+
+async def cloak_arkose_blob(args: dict | None = None, **kw: Any) -> Dict[str, Any]:
+    """Hand over the Arkose data-exchange blob seen on the wire.
+
+    The blob lives in a response body, so it cannot be read from a snapshot, and
+    it is issued by the request the submit button fires — which is why capture
+    runs passively from the moment the profile is attached rather than being
+    armed on demand.
+    """
+    args = args or {}
+    try:
+        wait_ms = max(0, min(60000, int(args.get("wait_ms") or 0)))
+    except (TypeError, ValueError):
+        wait_ms = 0
+    keep = bool(args.get("peek"))
+
+    cdp_url = profile_state.cdp_url_for_task(kw.get("task_id"))
+    if not cdp_url:
+        return {"error": "No Cloak CDP binding for this task. Call cloak_set_active(profile=...) first."}
+
+    from . import arkose
+
+    deadline = time.time() + (wait_ms / 1000.0)
+    while True:
+        found = arkose.peek(cdp_url) if keep else arkose.take(cdp_url)
+        if found:
+            return {
+                "blob": found["blob"],
+                "source_url": found.get("source_url", ""),
+                "age_ms": int(max(0.0, time.time() * 1000.0 - found.get("seen_at_ms", 0.0))),
+                "consumed": not keep,
+            }
+        if time.time() >= deadline:
+            return {
+                "blob": None,
+                "hint": (
+                    "No blob seen yet. It is issued by the request the submit button "
+                    "fires, so click that button first, then call this with wait_ms. "
+                    "If the site does not gate Arkose on a blob, solve without one."
+                ),
+            }
+        await asyncio.sleep(0.5)
 
 
 async def cloak_detect_captcha(args: dict | None = None, **kw: Any) -> Dict[str, Any]:

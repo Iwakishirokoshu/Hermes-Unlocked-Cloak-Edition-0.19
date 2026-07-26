@@ -2244,3 +2244,85 @@ def test_solve_schema_offers_every_wired_provider():
     providers = SCHEMA_SOLVE_CAPTCHA["properties"]["provider"]["enum"]
     assert providers == ["auto", "capsolver", "2captcha", "anticaptcha"]
     assert "blob" in SCHEMA_SOLVE_CAPTCHA["properties"]["extra"]["description"]
+
+
+def test_arkose_blob_capture_extracts_and_is_single_use():
+    """The blob lives in a response body, so it cannot be read from a snapshot,
+    and it is issued by the request the submit button fires — which is why the
+    capture is passive rather than armed on demand."""
+    import asyncio
+    from plugins.browser.cloak._impl import arkose
+
+    cdp = "ws://bridge:8081/api/profiles/p1/cdp"
+    arkose.clear(cdp)
+
+    class Response:
+        url = "https://www.figma.com/api/arkose/on_for_user"
+
+        async def json(self):
+            return {
+                "meta": {
+                    "arkose_required_for_user": True,
+                    "data_exchange_blob": "BLOB-FROM-WIRE",
+                }
+            }
+
+    asyncio.run(arkose._on_response(Response(), cdp))
+    assert arkose.peek(cdp)["blob"] == "BLOB-FROM-WIRE"
+    assert arkose.peek(cdp)["source_url"].endswith("on_for_user")
+
+    # Handed over once, then forgotten: blob and token are a single-use pair.
+    assert arkose.take(cdp)["blob"] == "BLOB-FROM-WIRE"
+    assert arkose.take(cdp) is None
+
+
+def test_arkose_capture_ignores_unrelated_traffic():
+    """Opening every response body would drag each page asset back through CDP."""
+    import asyncio
+    from plugins.browser.cloak._impl import arkose
+
+    cdp = "ws://bridge:8081/api/profiles/p2/cdp"
+    arkose.clear(cdp)
+
+    class Boom:
+        url = "https://www.figma.com/static/app.js"
+
+        async def json(self):
+            raise AssertionError("unrelated responses must not be opened")
+
+    asyncio.run(arkose._on_response(Boom(), cdp))
+    assert arkose.peek(cdp) is None
+
+    class NotJson:
+        url = "https://figma-api.arkoselabs.com/thing"
+
+        async def json(self):
+            raise ValueError("not json")
+
+    asyncio.run(arkose._on_response(NotJson(), cdp))  # must not raise
+    assert arkose.peek(cdp) is None
+
+
+def test_arkose_capture_is_installed_once_per_context():
+    from plugins.browser.cloak._impl import arkose
+
+    class Context:
+        def __init__(self):
+            self.handlers = []
+
+        def on(self, event, cb):
+            self.handlers.append(event)
+
+    ctx = Context()
+    assert arkose.install_capture(ctx, "ws://x") is True
+    assert arkose.install_capture(ctx, "ws://x") is False
+    assert ctx.handlers == ["response"]
+    assert arkose.install_capture(None, "ws://x") is False
+
+
+def test_blob_tool_is_registered_with_its_schema():
+    from plugins.browser.cloak._impl import tools_manage as tm
+
+    props = tm.SCHEMA_ARKOSE_BLOB["properties"]
+    assert set(props) == {"wait_ms", "peek"}
+    assert "extra.blob" in tm.SCHEMA_ARKOSE_BLOB["description"]
