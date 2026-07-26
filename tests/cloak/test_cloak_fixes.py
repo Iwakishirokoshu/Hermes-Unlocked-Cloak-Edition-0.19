@@ -1301,12 +1301,12 @@ def test_snapshot_ref_maps_onto_playwright_aria_ref():
     assert seen == ["aria-ref=e9"]
 
 
-def _stub_text_input_page(monkeypatch, *, active_selector, record):
+def _stub_text_input_page(monkeypatch, *, active_selector, record, prefocused=False):
     """Wire tools_input onto a fake page whose focus follows the native click."""
     from contextlib import asynccontextmanager
     from plugins.browser.cloak._impl import tools_input as ti
 
-    focused = {"selector": None}
+    focused = {"selector": active_selector if prefocused else None}
 
     class Locator:
         def __init__(self, sel):
@@ -1336,8 +1336,14 @@ def _stub_text_input_page(monkeypatch, *, active_selector, record):
 
     monkeypatch.setattr(ti, "_hold_page", fake_hold)
     monkeypatch.setattr(ti, "_native_click", fake_native_click)
-    monkeypatch.setattr(ti, "_clear_field", lambda page, target, timeout: None)
-    monkeypatch.setattr(ti, "_apply_verification", None, raising=False)
+    async def fake_clear(page, target, timeout):
+        record["cleared"] = target
+
+    monkeypatch.setattr(ti, "_clear_field", fake_clear)
+    async def fake_verify(page, selector, expected, timeout, retries, result):
+        result["verified"] = True
+
+    monkeypatch.setattr(ti, "_apply_verification", fake_verify)
     return ti
 
 
@@ -1373,24 +1379,38 @@ def test_unresolvable_ref_refuses_rather_than_typing_blind(monkeypatch):
         assert "selector=" in out["message"]
     assert "typed" not in record
 
-def test_text_input_without_ref_or_selector_says_what_to_pass():
-    """The refusal has to name the way out, or the model just retries it."""
+def test_text_input_falls_back_to_the_focused_field(monkeypatch):
+    """The model kept calling browser_fill with neither ref nor selector and
+    being refused with the same message eight times running. It almost always
+    clicks the field first, so type where the caret already is."""
     import asyncio
-    from plugins.browser.cloak._impl import tools_input as ti
 
-    def explode(*args, **kwargs):
-        raise AssertionError("must refuse before touching the browser pool")
+    record: dict = {}
+    ti = _stub_text_input_page(
+        monkeypatch, active_selector="#email", record=record, prefocused=True
+    )
 
-    original = ti._hold_page
-    ti._hold_page = explode
-    try:
-        for handler in (ti.browser_type, ti.browser_fill):
-            out = asyncio.run(handler({"text": "hello"}))
-            assert out["error"] == "target_required", out
-            assert "browser_snapshot" in out["message"]
-            assert "selector=" in out["message"]
-    finally:
-        ti._hold_page = original
+    out = asyncio.run(ti.browser_fill({"text": "hello"}))
+    assert out["ok"] is True
+    assert out["target"] == "#email"
+    assert out["target_source"] == "focus"
+    assert record["typed"] == ("#email", "hello")
+    assert "clicked" not in record, "a focus fallback must not click anything"
+
+
+def test_text_input_still_refuses_when_nothing_is_focused(monkeypatch):
+    """No target and no caret in a field — there is nowhere sane to type."""
+    import asyncio
+
+    record: dict = {}
+    ti = _stub_text_input_page(monkeypatch, active_selector=None, record=record)
+
+    for handler in (ti.browser_type, ti.browser_fill):
+        out = asyncio.run(handler({"text": "hello"}))
+        assert out["error"] == "target_required", out
+        assert "browser_snapshot" in out["message"]
+        assert "selector=" in out["message"]
+    assert "typed" not in record
 
 class _KeyBuffer:
     """Minimal stand-in for the raw keyboard: keeps what the field would hold."""

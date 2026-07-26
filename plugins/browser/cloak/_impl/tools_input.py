@@ -195,6 +195,16 @@ _SELECTOR_FROM_ACTIVE_JS = r"""
 """
 
 
+async def _selector_from_focus(page: Any) -> str:
+    """CSS selector for the focused field, or "" when nothing editable has focus."""
+    try:
+        resolved = await page.evaluate(_SELECTOR_FROM_ACTIVE_JS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not read the focused element: %s", exc)
+        return ""
+    return str(resolved or "").strip()
+
+
 async def _selector_from_ref(page: Any, ref_target: str, task_id: Any) -> str:
     """Turn a snapshot ref into a CSS selector by borrowing agent-browser's click.
 
@@ -221,12 +231,7 @@ async def _selector_from_ref(page: Any, ref_target: str, task_id: Any) -> str:
                 return ""
     except Exception:  # noqa: BLE001
         pass  # non-JSON reply — fall through and let the focus check decide
-    try:
-        resolved = await page.evaluate(_SELECTOR_FROM_ACTIVE_JS)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("could not read the focused element after %s: %s", ref_target, exc)
-        return ""
-    return str(resolved or "").strip()
+    return await _selector_from_focus(page)
 
 
 def _no_target_error() -> Dict[str, Any]:
@@ -321,10 +326,9 @@ async def browser_type(args: dict, **kw: Any) -> Any:
     timeout_ms = args.get("timeout_ms", 30000)
     task_id = kw.get("task_id")
     target = selector.strip() or _normalize_target(ref, selector)
-    if not target:
-        return _no_target_error()
     verify = args.get("verify", True)
     max_retries = int(args.get("max_retries", 2))
+    target_source = "selector"
 
     async with _hold_page(task_id) as page:
         if isinstance(page, dict):
@@ -335,6 +339,17 @@ async def browser_type(args: dict, **kw: Any) -> Any:
                 return _humanized_selector_required(target)
             selector = resolved  # a real selector, so verification runs too
             target = resolved
+            target_source = "ref"
+        elif not target:
+            # Nothing named. The model almost always clicks the field
+            # first, so type where the caret already is rather than
+            # refusing and being retried with the same empty arguments.
+            resolved = await _selector_from_focus(page)
+            if not resolved:
+                return _no_target_error()
+            selector = resolved
+            target = resolved
+            target_source = "focus"
         try:
             loc = _locator_for(page, target)
             value_before = ""
@@ -345,7 +360,8 @@ async def browser_type(args: dict, **kw: Any) -> Any:
                     value_before = ""
             await loc.type(text, timeout=timeout_ms)
             result: Dict[str, Any] = {
-                "ok": True, "target": target, "chars": len(text), "humanized": True
+                "ok": True, "target": target, "chars": len(text),
+                "humanized": True, "target_source": target_source,
             }
             if verify and selector and not target.startswith("@"):
                 expected = value_before + text
@@ -362,10 +378,9 @@ async def browser_fill(args: dict, **kw: Any) -> Any:
     timeout_ms = args.get("timeout_ms", 30000)
     task_id = kw.get("task_id")
     target = selector.strip() or _normalize_target(ref, selector)
-    if not target:
-        return _no_target_error()
     verify = args.get("verify", True)
     max_retries = int(args.get("max_retries", 2))
+    target_source = "selector"
 
     async with _hold_page(task_id) as page:
         if isinstance(page, dict):
@@ -376,12 +391,24 @@ async def browser_fill(args: dict, **kw: Any) -> Any:
                 return _humanized_selector_required(target)
             selector = resolved  # a real selector, so verification runs too
             target = resolved
+            target_source = "ref"
+        elif not target:
+            # Nothing named. The model almost always clicks the field
+            # first, so type where the caret already is rather than
+            # refusing and being retried with the same empty arguments.
+            resolved = await _selector_from_focus(page)
+            if not resolved:
+                return _no_target_error()
+            selector = resolved
+            target = resolved
+            target_source = "focus"
         try:
             loc = _locator_for(page, target)
             await _clear_field(page, target, timeout_ms)
             await loc.type(text, timeout=timeout_ms)
             result: Dict[str, Any] = {
-                "ok": True, "target": target, "chars": len(text), "humanized": True
+                "ok": True, "target": target, "chars": len(text),
+                "humanized": True, "target_source": target_source,
             }
             if verify and selector and not target.startswith("@"):
                 await _apply_verification(page, selector, text, timeout_ms, max_retries, result)
