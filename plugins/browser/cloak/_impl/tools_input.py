@@ -57,7 +57,7 @@ SCHEMA_CLICK = {
 SCHEMA_TYPE = {
     "type": "object",
     "properties": {
-        "ref": {"type": "string", "description": "Not usable for text input — snapshot refs belong to agent-browser, a different client from the humanized typing engine. Pass selector instead."},
+        "ref": {"type": "string", "description": "Snapshot ref, e.g. e5. Resolved to a real selector by focusing the field first, so a ref from browser_snapshot is enough."},
         "selector": {"type": "string", "description": "CSS selector for the field — required for humanized text input, e.g. input[type='email'] or #email. Read the id/name/type off the element in the snapshot."},
         "text": {"type": "string"},
         "timeout_ms": {"type": "integer", "default": 30000},
@@ -135,7 +135,7 @@ def _normalize_ref(ref: str) -> str:
     recognises the ``@e5`` spelling. A bare ref therefore fell through to
     ``page.locator("e5")`` — a CSS lookup for a nonexistent ``<e5>`` tag that
     burns the full timeout twice before failing, instead of being routed to the
-    native click path (which owns the refs) or refused outright for text input.
+    native click path, which is what actually owns the refs.
     """
     value = str(ref or "").strip()
     match = _SNAPSHOT_REF_RE.match(value)
@@ -153,13 +153,80 @@ def _humanized_selector_required(ref: str) -> Dict[str, Any]:
         "error": "humanized_selector_required",
         "ref": ref,
         "message": (
-            "Snapshot refs address elements inside agent-browser, which is a different "
-            "client from the humanized typing engine — they cannot be resolved here. "
-            "Pass a CSS selector instead, e.g. selector=\"input[type='email']\" or "
-            "selector=\"#email\"; read the id/name/type off the element in the snapshot. "
-            "Refs still work for browser_click. No native fallback was used."
+            "This ref could not be resolved to a unique field — focusing it did not land "
+            "on an editable element, or the element cannot be addressed unambiguously. "
+            "Re-run browser_snapshot for a fresh ref, or pass a CSS selector directly "
+            "(e.g. selector=\"input[type='email']\"). No native fallback was used for typing."
         ),
     }
+
+
+# Identify the focused field and describe it with a selector stable enough for
+# the verification pass. Prefers id, then a unique name/type, then a short
+# structural path; returns null rather than a selector that matches many nodes.
+_SELECTOR_FROM_ACTIVE_JS = r"""
+() => {
+  const el = document.activeElement;
+  if (!el) return null;
+  const editable = (el.matches && el.matches('input, textarea')) || el.isContentEditable;
+  if (!editable) return null;
+  const esc = (s) => (window.CSS && CSS.escape) ? CSS.escape(s) : String(s).replace(/[^\w-]/g, '\\$&');
+  const unique = (sel) => { try { return document.querySelectorAll(sel).length === 1; } catch (e) { return false; } };
+  if (el.id && unique('#' + esc(el.id))) return '#' + esc(el.id);
+  const tag = el.tagName.toLowerCase();
+  if (el.name) { const s = tag + '[name="' + String(el.name).replace(/"/g, '\\"') + '"]'; if (unique(s)) return s; }
+  if (el.type) { const s = tag + '[type="' + String(el.type).replace(/"/g, '\\"') + '"]'; if (unique(s)) return s; }
+  const parts = [];
+  let node = el;
+  while (node && node.nodeType === 1 && parts.length < 6) {
+    if (node.id) { parts.unshift('#' + esc(node.id)); break; }
+    let part = node.tagName.toLowerCase();
+    const parent = node.parentElement;
+    if (parent) {
+      const sibs = Array.prototype.filter.call(parent.children, c => c.tagName === node.tagName);
+      if (sibs.length > 1) part += ':nth-of-type(' + (sibs.indexOf(node) + 1) + ')';
+    }
+    parts.unshift(part);
+    node = node.parentElement;
+  }
+  const sel = parts.join(' > ');
+  return unique(sel) ? sel : null;
+}
+"""
+
+
+async def _selector_from_ref(page: Any, ref_target: str, task_id: Any) -> str:
+    """Turn a snapshot ref into a CSS selector by borrowing agent-browser's click.
+
+    Snapshot refs belong to agent-browser; this Playwright client cannot resolve
+    them at all (``aria-ref`` lookups match zero elements here). Both clients
+    drive the same tab, though — verified live — so a native click puts focus on
+    the field and ``document.activeElement`` identifies it. From there the normal
+    humanized path runs on a real selector, verification included.
+
+    Returns "" when the ref could not be turned into a unique selector; the
+    caller then refuses rather than typing into whatever happens to be focused.
+    """
+    try:
+        raw = _native_click(ref_target, task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("native focus click failed for %s: %s", ref_target, exc)
+        return ""
+    try:
+        if isinstance(raw, str) and raw.lstrip().startswith("{"):
+            import json as _json
+
+            if not _json.loads(raw).get("success", True):
+                logger.debug("native focus click reported failure for %s", ref_target)
+                return ""
+    except Exception:  # noqa: BLE001
+        pass  # non-JSON reply — fall through and let the focus check decide
+    try:
+        resolved = await page.evaluate(_SELECTOR_FROM_ACTIVE_JS)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("could not read the focused element after %s: %s", ref_target, exc)
+        return ""
+    return str(resolved or "").strip()
 
 
 def _no_target_error() -> Dict[str, Any]:
@@ -256,14 +323,18 @@ async def browser_type(args: dict, **kw: Any) -> Any:
     target = selector.strip() or _normalize_target(ref, selector)
     if not target:
         return _no_target_error()
-    if target.startswith("@"):
-        return _humanized_selector_required(target)
     verify = args.get("verify", True)
     max_retries = int(args.get("max_retries", 2))
 
     async with _hold_page(task_id) as page:
         if isinstance(page, dict):
             return page
+        if target.startswith("@"):
+            resolved = await _selector_from_ref(page, target, task_id)
+            if not resolved:
+                return _humanized_selector_required(target)
+            selector = resolved  # a real selector, so verification runs too
+            target = resolved
         try:
             loc = _locator_for(page, target)
             value_before = ""
@@ -293,14 +364,18 @@ async def browser_fill(args: dict, **kw: Any) -> Any:
     target = selector.strip() or _normalize_target(ref, selector)
     if not target:
         return _no_target_error()
-    if target.startswith("@"):
-        return _humanized_selector_required(target)
     verify = args.get("verify", True)
     max_retries = int(args.get("max_retries", 2))
 
     async with _hold_page(task_id) as page:
         if isinstance(page, dict):
             return page
+        if target.startswith("@"):
+            resolved = await _selector_from_ref(page, target, task_id)
+            if not resolved:
+                return _humanized_selector_required(target)
+            selector = resolved  # a real selector, so verification runs too
+            target = resolved
         try:
             loc = _locator_for(page, target)
             await _clear_field(page, target, timeout_ms)

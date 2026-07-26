@@ -1301,28 +1301,77 @@ def test_snapshot_ref_maps_onto_playwright_aria_ref():
     assert seen == ["aria-ref=e9"]
 
 
-def test_text_input_refuses_a_ref_with_an_actionable_message():
-    """Snapshot refs come from agent-browser; the humanized typing engine is a
-    separate Playwright client that cannot resolve them (verified live:
-    aria-ref lookups match zero elements). The refusal must therefore name the
-    way out, or the model just retries the same call."""
-    import asyncio
+def _stub_text_input_page(monkeypatch, *, active_selector, record):
+    """Wire tools_input onto a fake page whose focus follows the native click."""
+    from contextlib import asynccontextmanager
     from plugins.browser.cloak._impl import tools_input as ti
 
-    def explode(*args, **kwargs):
-        raise AssertionError("must refuse before touching the browser pool")
+    focused = {"selector": None}
 
-    original = ti._hold_page
-    ti._hold_page = explode
-    try:
-        for handler in (ti.browser_type, ti.browser_fill):
-            out = asyncio.run(handler({"ref": "e5", "text": "hello"}))
-            assert out["error"] == "humanized_selector_required"
-            assert out["ref"] == "@e5"
-            assert "selector=" in out["message"]
-            assert "browser_click" in out["message"]
-    finally:
-        ti._hold_page = original
+    class Locator:
+        def __init__(self, sel):
+            self.sel = sel
+
+        async def type(self, text, timeout=None):
+            record["typed"] = (self.sel, text)
+
+        async def input_value(self, timeout=None):
+            return ""
+
+    class Page:
+        def locator(self, sel):
+            return Locator(sel)
+
+        async def evaluate(self, js):
+            return focused["selector"]
+
+    @asynccontextmanager
+    async def fake_hold(task_id=None):
+        yield Page()
+
+    def fake_native_click(ref, task_id):
+        record["clicked"] = ref
+        focused["selector"] = active_selector
+        return '{"success": true, "clicked": "%s"}' % ref
+
+    monkeypatch.setattr(ti, "_hold_page", fake_hold)
+    monkeypatch.setattr(ti, "_native_click", fake_native_click)
+    monkeypatch.setattr(ti, "_clear_field", lambda page, target, timeout: None)
+    monkeypatch.setattr(ti, "_apply_verification", None, raising=False)
+    return ti
+
+
+def test_snapshot_ref_reaches_humanized_typing(monkeypatch):
+    """Refs belong to agent-browser and this Playwright client cannot resolve
+    them (aria-ref matches nothing — measured on a live profile). Both clients
+    drive the same tab, so a native click focuses the field and the focused
+    element yields a real selector for the humanized path."""
+    import asyncio
+
+    record: dict = {}
+    ti = _stub_text_input_page(monkeypatch, active_selector="#email", record=record)
+
+    out = asyncio.run(ti.browser_type({"ref": "e5", "text": "hello", "verify": False}))
+    assert out["ok"] is True
+    assert out["target"] == "#email"
+    assert record["clicked"] == "@e5"          # focus borrowed from agent-browser
+    assert record["typed"] == ("#email", "hello")   # typed humanized, by selector
+
+
+def test_unresolvable_ref_refuses_rather_than_typing_blind(monkeypatch):
+    """If focus did not land on an editable field, typing anyway would put the
+    text into whatever else has focus."""
+    import asyncio
+
+    record: dict = {}
+    ti = _stub_text_input_page(monkeypatch, active_selector=None, record=record)
+
+    for handler in (ti.browser_type, ti.browser_fill):
+        out = asyncio.run(handler({"ref": "e5", "text": "hello"}))
+        assert out["error"] == "humanized_selector_required"
+        assert out["ref"] == "@e5"
+        assert "selector=" in out["message"]
+    assert "typed" not in record
 
 def test_text_input_without_ref_or_selector_says_what_to_pass():
     """The refusal has to name the way out, or the model just retries it."""
